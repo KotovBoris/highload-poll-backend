@@ -143,7 +143,7 @@ func (s *Server) handleGetPoll(w http.ResponseWriter, r *http.Request) {
 	// Если у клиента уже есть cookie — повторно не выдаём (страница
 	// перезагружается, но новых cookie не появляется).
 	if _, has := fingerprint.CookieValue(r); !has {
-		if !s.limitIssuing || s.allowIssue(id, r, poll) {
+		if !s.limitIssuing || s.allowIssue(id, r, poll.Poll) {
 			_, cookieValue := s.signer.Issue(id)
 			http.SetCookie(w, &http.Cookie{
 				Name:     fingerprint.CookieName,
@@ -156,14 +156,17 @@ func (s *Server) handleGetPoll(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	poll.Results = nil // результаты не публичны
-	httpx.WriteJSON(w, http.StatusOK, poll)
+	// Результаты не публичны. Значение из кэша неизменяемо, поэтому отдаём
+	// копию без поля Results (копия дешевле, чем мутация разделяемого значения).
+	out := *poll.Poll
+	out.Results = nil
+	httpx.WriteJSON(w, http.StatusOK, &out)
 }
 
 // allowIssue регистрирует выдачу cookie по ключу (poll_id, IP).
 // Возвращает false, если для этого IP исчерпан лимит выдач по опросу.
 // UA в ключ не входит: его ротация бесплатна и обесценила бы лимит.
-func (s *Server) allowIssue(pollID string, r *http.Request, poll model.Poll) bool {
+func (s *Server) allowIssue(pollID string, r *http.Request, poll *model.Poll) bool {
 	key := issueKey(pollID + "|" + fingerprint.HashIP(fingerprint.ClientIP(r)))
 	// Помним запись до ends_at + запас: после закрытия опроса лимит не нужен.
 	expiresAt := poll.EndsAt.Add(issueTTLGrace)
@@ -186,13 +189,13 @@ func (s *Server) handleVote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !validOption(poll, req.OptionID) {
+	if _, ok := poll.OptionSet[req.OptionID]; !ok {
 		httpx.WriteError(w, http.StatusBadRequest, httpx.ErrBadRequest, "unknown option_id")
 		return
 	}
 
 	now := s.now()
-	if !now.Before(poll.EndsAt) {
+	if !now.Before(poll.Poll.EndsAt) {
 		// Опрос закрыт: инициируем закрытие (досылка остатка + done) и
 		// отклоняем голос. Закрытие идемпотентно.
 		go s.closePoll(id)
@@ -260,21 +263,11 @@ func (s *Server) sweep() {
 		if err != nil {
 			continue
 		}
-		if !now.Before(poll.EndsAt) {
+		if !now.Before(poll.Poll.EndsAt) {
 			s.closePoll(id)
 		}
 	}
 	s.buf.Cleanup(s.closeTTL, now)
-}
-
-// validOption проверяет, что option_id входит в список опций опроса.
-func validOption(poll model.Poll, optionID int) bool {
-	for _, o := range poll.Options {
-		if o.ID == optionID {
-			return true
-		}
-	}
-	return false
 }
 
 // writePollError переводит ошибку получения метаданных в HTTP-ответ.

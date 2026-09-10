@@ -17,23 +17,34 @@ type outMsg struct {
 	done  bool
 }
 
+// Размер шарда: сколько независимых сегментов буфера создаём. Каждый шард
+// обслуживает свой набор poll_id под собственным мьютексом.
+const bufferShardCount = 64
+
 // voteBuffer — потокобезопасный in-memory буфер голосов, разбитый по опросам.
 //
 // Ключевая гарантия порядка: и «срабатывание батча» (набор полного батча), и
 // закрытие опроса (остаток + "done") формируют исходящую очередь pb.out СТРОГО
-// под мьютексом буфера. Отправкой занимается отдельный drainer-горутина на
+// под мьютексом шарда. Отправкой занимается отдельный drainer-горутина на
 // опрос, которая разбирает очередь в порядке добавления. Поэтому "done" не может
 // обогнать батч, порождённый конкурентным Add() — а именно эта гонка приводила
 // к потере голосов.
 //
-// Раньше решение об отправке принималось вне мьютекса (Add возвращал батч, а
-// вызывающий его отправлял), из-за чего closePoll мог вклиниться между
-// формированием батча и его отправкой и отправить "done" раньше батча.
+// Шардирование по poll_id: один глобальный мьютекс стал бы точкой contention
+// при десятках тысяч RPS на многoядерной машине (pprof показывал заметную долю
+// в futex/lock). Шард выбирается хешем poll_id, поэтому все операции одного
+// опроса идут под одним мьютексом (гарантия порядка сохраняется), а разные
+// опросы не блокируют друг друга.
 type voteBuffer struct {
-	mu        sync.Mutex
-	polls     map[string]*pollBuffer
+	shards    [bufferShardCount]bufferShard
 	batchSize int
 	send      sendFunc
+}
+
+// bufferShard — независимый сегмент буфера со своим мьютексом.
+type bufferShard struct {
+	mu    sync.Mutex
+	polls map[string]*pollBuffer
 }
 
 type pollBuffer struct {
@@ -50,19 +61,32 @@ func newVoteBuffer(batchSize int, send sendFunc) *voteBuffer {
 		batchSize = 10000
 	}
 	return &voteBuffer{
-		polls:     make(map[string]*pollBuffer),
 		batchSize: batchSize,
 		send:      send,
 	}
 }
 
+// shardFor выбирает шард по poll_id (FNV-1a). Один и тот же опрос всегда
+// попадает в один шард — это и обеспечивает порядок внутри опроса.
+func (b *voteBuffer) shardFor(pollID string) *bufferShard {
+	var h uint32 = 2166136261
+	for i := 0; i < len(pollID); i++ {
+		h ^= uint32(pollID[i])
+		h *= 16777619
+	}
+	return &b.shards[h%bufferShardCount]
+}
+
 // pollLocked возвращает буфер опроса, создавая его при необходимости.
-// Вызывается под удерживаемым мьютексом.
-func (b *voteBuffer) pollLocked(pollID string) *pollBuffer {
-	pb := b.polls[pollID]
+// Вызывается под удерживаемым мьютексом шарда.
+func (s *bufferShard) pollLocked(pollID string) *pollBuffer {
+	if s.polls == nil {
+		s.polls = make(map[string]*pollBuffer)
+	}
+	pb := s.polls[pollID]
 	if pb == nil {
 		pb = &pollBuffer{}
-		b.polls[pollID] = pb
+		s.polls[pollID] = pb
 	}
 	return pb
 }
@@ -70,10 +94,11 @@ func (b *voteBuffer) pollLocked(pollID string) *pollBuffer {
 // Add добавляет голос в буфер опроса.
 // Возвращает false, если опрос закрыт (голос не принят).
 func (b *voteBuffer) Add(pollID string, v model.Vote) (accepted bool) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+	sh := b.shardFor(pollID)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 
-	pb := b.pollLocked(pollID)
+	pb := sh.pollLocked(pollID)
 	if pb.closed {
 		return false
 	}
@@ -82,7 +107,7 @@ func (b *voteBuffer) Add(pollID string, v model.Vote) (accepted bool) {
 		pb.out = append(pb.out, outMsg{votes: pb.votes})
 		pb.votes = nil
 	}
-	b.ensureDrainerLocked(pollID, pb)
+	ensureDrainerLocked(sh, pollID, pb, b.send)
 	return true
 }
 
@@ -90,10 +115,11 @@ func (b *voteBuffer) Add(pollID string, v model.Vote) (accepted bool) {
 // Возвращает alreadyClosed=true, если опрос был закрыт ранее (идемпотентность:
 // "done" уходит ровно один раз).
 func (b *voteBuffer) Close(pollID string, now time.Time) (alreadyClosed bool) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+	sh := b.shardFor(pollID)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 
-	pb := b.pollLocked(pollID)
+	pb := sh.pollLocked(pollID)
 	if pb.closed {
 		return true
 	}
@@ -104,13 +130,13 @@ func (b *voteBuffer) Close(pollID string, now time.Time) (alreadyClosed bool) {
 		pb.votes = nil
 	}
 	pb.out = append(pb.out, outMsg{done: true})
-	b.ensureDrainerLocked(pollID, pb)
+	ensureDrainerLocked(sh, pollID, pb, b.send)
 	return false
 }
 
 // ensureDrainerLocked запускает drainer опроса (один раз) и будит его, если он
-// уже работает. Вызывается под удерживаемым мьютексом.
-func (b *voteBuffer) ensureDrainerLocked(pollID string, pb *pollBuffer) {
+// уже работает. Вызывается под удерживаемым мьютексом шарда.
+func ensureDrainerLocked(sh *bufferShard, pollID string, pb *pollBuffer, send sendFunc) {
 	if pb.draining {
 		select {
 		case pb.wake <- struct{}{}:
@@ -120,18 +146,19 @@ func (b *voteBuffer) ensureDrainerLocked(pollID string, pb *pollBuffer) {
 	}
 	pb.draining = true
 	pb.wake = make(chan struct{}, 1)
-	go b.drain(pollID, pb)
+	go drainPoll(sh, pollID, pb, send)
 }
 
-// drain последовательно отправляет исходящую очередь опроса. Гарантирует, что
-// вызывающий send() получает элементы в порядке добавления. Завершается, когда
-// опрос закрыт и очередь пуста.
-func (b *voteBuffer) drain(pollID string, pb *pollBuffer) {
+// drainPoll последовательно отправляет исходящую очередь опроса. Гарантирует,
+// что send() получает элементы в порядке добавления. Завершается, когда опрос
+// закрыт и очередь пуста. Мьютекс шарда — тот же, под которым наполняется out,
+// поэтому порядок и отсутствие гонок сохранены.
+func drainPoll(sh *bufferShard, pollID string, pb *pollBuffer, send sendFunc) {
 	for {
-		b.mu.Lock()
+		sh.mu.Lock()
 		if len(pb.out) == 0 {
 			closed := pb.closed
-			b.mu.Unlock()
+			sh.mu.Unlock()
 			if closed {
 				return
 			}
@@ -140,34 +167,41 @@ func (b *voteBuffer) drain(pollID string, pb *pollBuffer) {
 		}
 		msg := pb.out[0]
 		pb.out = pb.out[1:]
-		b.mu.Unlock()
+		sh.mu.Unlock()
 
-		if b.send != nil {
-			b.send(pollID, msg.votes, msg.done)
+		if send != nil {
+			send(pollID, msg.votes, msg.done)
 		}
 	}
 }
 
 // PollIDs возвращает список известных буферу опросов (для фонового watcher'а).
+// Обходит все шарды, каждый — под своим мьютексом (блокировка не общая).
 func (b *voteBuffer) PollIDs() []string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	ids := make([]string, 0, len(b.polls))
-	for id := range b.polls {
-		ids = append(ids, id)
+	var ids []string
+	for i := range b.shards {
+		sh := &b.shards[i]
+		sh.mu.Lock()
+		for id := range sh.polls {
+			ids = append(ids, id)
+		}
+		sh.mu.Unlock()
 	}
 	return ids
 }
 
 // Cleanup удаляет буферы закрытых опросов, которые закрыты более ttl назад.
 func (b *voteBuffer) Cleanup(ttl time.Duration, now time.Time) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	for id, pb := range b.polls {
-		// Удаляем только когда очередь уже разобрана drainer'ом, иначе
-		// потеряем неотправленные элементы.
-		if pb.closed && len(pb.out) == 0 && now.Sub(pb.closedAt) > ttl {
-			delete(b.polls, id)
+	for i := range b.shards {
+		sh := &b.shards[i]
+		sh.mu.Lock()
+		for id, pb := range sh.polls {
+			// Удаляем только когда очередь уже разобрана drainer'ом, иначе
+			// потеряем неотправленные элементы.
+			if pb.closed && len(pb.out) == 0 && now.Sub(pb.closedAt) > ttl {
+				delete(sh.polls, id)
+			}
 		}
+		sh.mu.Unlock()
 	}
 }
