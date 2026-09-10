@@ -42,7 +42,7 @@ func run(logger *slog.Logger) error {
 	cfg := consumer.Config{
 		DonePercent:   config.Int("COMMIT_DONE_PERCENT", 90),
 		StaleMessages: config.Int("COMMIT_STALE_MESSAGES", 1000),
-		CloseGrace:    config.Duration("CLOSE_GRACE", 30*time.Second),
+		CloseGrace:    config.Duration("CLOSE_GRACE", 5*time.Second),
 		CloseHardTmo:  config.Duration("CLOSE_HARD_TIMEOUT", 5*time.Minute),
 	}
 

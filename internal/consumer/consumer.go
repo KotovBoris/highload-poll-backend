@@ -81,8 +81,15 @@ func New(reader kafka.Reader, client resultsclient.Client, cfg Config, logger *s
 	if cfg.StaleMessages <= 0 {
 		cfg.StaleMessages = 1000
 	}
+	// CloseGrace — ОБЯЗАТЕЛЬНАЯ пауза после ends_at при нескольких воркерах.
+	// Кворум "done" считается по ИЗВЕСТНЫМ воркерам (workersSeen). В момент
+	// ends_at о каком-то воркере consumer может ещё не знать: он не набрал
+	// полный батч, и его голоса уйдут только вместе с его "done". Если grace=0,
+	// опрос завершится по "done" первого воркера (кворум 1 из 1), а голоса
+	// остальных будут потеряны. Проверено на сценарии с 2 воркерами: grace=0
+	// терял ~половину голосов. 5s хватает локально; в проде рекомендуется ~30s.
 	if cfg.CloseGrace <= 0 {
-		cfg.CloseGrace = 30 * time.Second
+		cfg.CloseGrace = 5 * time.Second
 	}
 	if cfg.CloseHardTmo <= 0 {
 		cfg.CloseHardTmo = 5 * time.Minute

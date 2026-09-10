@@ -81,9 +81,8 @@ func NewServer(client resultsclient.Client, sender *Sender, cfg Config, logger *
 		logger.Warn("COOKIE_SECRET is empty: using random secret, cookies will not survive restart")
 	}
 	now := time.Now
-	return &Server{
+	srv := &Server{
 		cache:               newPollCache(client, cfg.CacheTTL, now),
-		buf:                 newVoteBuffer(cfg.BatchSize),
 		sender:              sender,
 		signer:              signer,
 		limiter:             newIssueLimiter(cfg.MaxIssuedEntries, now),
@@ -94,6 +93,21 @@ func NewServer(client resultsclient.Client, sender *Sender, cfg Config, logger *
 		closeTTL:            cfg.CloseTTL,
 		limitIssuing:        !cfg.DisableIssueLimit,
 	}
+	// Буфер сам ставит элементы в очередь отправки под своим мьютексом —
+	// это и даёт гарантию, что "done" не обгонит батч (см. buffer.go).
+	srv.buf = newVoteBuffer(cfg.BatchSize, srv.sendFromBuffer)
+	return srv
+}
+
+// sendFromBuffer — колбэк буфера: превращает исходящий элемент опроса в
+// Kafka-сообщение. Вызывается drainer'ом опроса строго в порядке добавления.
+func (s *Server) sendFromBuffer(pollID string, votes []model.Vote, done bool) {
+	s.sender.Enqueue(model.VoteBatch{
+		PollID:   pollID,
+		WorkerID: s.workerID,
+		Votes:    votes,
+		Done:     done,
+	})
 }
 
 // SetNow подменяет источник времени (для тестов).
@@ -189,13 +203,11 @@ func (s *Server) handleVote(w http.ResponseWriter, r *http.Request) {
 	// Подпись проверяется относительно конкретного опроса: cookie,
 	// выданная для другого опроса, отбрасывается и уходит в fallback.
 	fp := fingerprint.FromRequest(r, id, s.signer)
-	flush, closed := s.buf.Add(id, model.Vote{Fingerprint: fp, OptionID: req.OptionID})
-	if closed {
+	// Add сам поставит в очередь отправки как полный батч, так и (если опрос
+	// закрылся конкурентно) отказ — под тем же мьютексом, что и Close.
+	if !s.buf.Add(id, model.Vote{Fingerprint: fp, OptionID: req.OptionID}) {
 		httpx.WriteError(w, http.StatusForbidden, httpx.ErrClosed, "poll closed")
 		return
-	}
-	if len(flush) > 0 {
-		s.sender.Enqueue(model.VoteBatch{PollID: id, WorkerID: s.workerID, Votes: flush})
 	}
 
 	httpx.WriteJSON(w, http.StatusAccepted, model.VoteResponse{Status: "accepted"})
@@ -206,17 +218,14 @@ func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// closePoll закрывает опрос: досылает остаток буфера и "done"-сообщение.
-// Идемпотентно: повторный вызов не отправит "done" дважды.
+// closePoll закрывает опрос: ставит в очередь остаток буфера и "done".
+// Идемпотентно: повторный вызов не отправит "done" дважды. Всё делается под
+// мьютексом буфера, поэтому "done" гарантированно идёт после любого батча,
+// сформированного конкурентным Add().
 func (s *Server) closePoll(pollID string) {
-	flush, alreadyClosed := s.buf.Close(pollID, s.now())
-	if alreadyClosed {
-		return
+	if s.buf.Close(pollID, s.now()) {
+		return // уже закрыт ранее — "done" уже отправлен
 	}
-	if len(flush) > 0 {
-		s.sender.Enqueue(model.VoteBatch{PollID: pollID, WorkerID: s.workerID, Votes: flush})
-	}
-	s.sender.Enqueue(model.VoteBatch{PollID: pollID, WorkerID: s.workerID, Done: true})
 	s.logger.Info("poll closed by api worker", "poll_id", pollID, "worker_id", s.workerID)
 }
 

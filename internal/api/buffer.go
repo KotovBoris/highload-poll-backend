@@ -7,78 +7,145 @@ import (
 	"github.com/KotovBoris/highload-poll-backend/internal/model"
 )
 
+// sendFunc отправляет один исходящий элемент опроса во внешний путь (Kafka).
+// votes непуст — обычный батч; done=true — маркер завершения.
+type sendFunc func(pollID string, votes []model.Vote, done bool)
+
+// outMsg — элемент исходящей очереди опроса.
+type outMsg struct {
+	votes []model.Vote
+	done  bool
+}
+
 // voteBuffer — потокобезопасный in-memory буфер голосов, разбитый по опросам.
 //
-// При достижении batchSize голосов по опросу буфер «срабатывает» и отдаёт
-// накопленный срез вызывающей стороне для отправки в Kafka. Буфер также умеет
-// закрывать опрос: после закрытия новые голоса не принимаются, а остаток
-// выдаётся один раз (для досылки перед "done").
+// Ключевая гарантия порядка: и «срабатывание батча» (набор полного батча), и
+// закрытие опроса (остаток + "done") формируют исходящую очередь pb.out СТРОГО
+// под мьютексом буфера. Отправкой занимается отдельный drainer-горутина на
+// опрос, которая разбирает очередь в порядке добавления. Поэтому "done" не может
+// обогнать батч, порождённый конкурентным Add() — а именно эта гонка приводила
+// к потере голосов.
+//
+// Раньше решение об отправке принималось вне мьютекса (Add возвращал батч, а
+// вызывающий его отправлял), из-за чего closePoll мог вклиниться между
+// формированием батча и его отправкой и отправить "done" раньше батча.
 type voteBuffer struct {
 	mu        sync.Mutex
 	polls     map[string]*pollBuffer
 	batchSize int
+	send      sendFunc
 }
 
 type pollBuffer struct {
 	votes    []model.Vote
+	out      []outMsg
 	closed   bool
 	closedAt time.Time
+	draining bool
+	wake     chan struct{}
 }
 
-func newVoteBuffer(batchSize int) *voteBuffer {
+func newVoteBuffer(batchSize int, send sendFunc) *voteBuffer {
 	if batchSize <= 0 {
 		batchSize = 10000
 	}
 	return &voteBuffer{
 		polls:     make(map[string]*pollBuffer),
 		batchSize: batchSize,
+		send:      send,
 	}
+}
+
+// pollLocked возвращает буфер опроса, создавая его при необходимости.
+// Вызывается под удерживаемым мьютексом.
+func (b *voteBuffer) pollLocked(pollID string) *pollBuffer {
+	pb := b.polls[pollID]
+	if pb == nil {
+		pb = &pollBuffer{}
+		b.polls[pollID] = pb
+	}
+	return pb
 }
 
 // Add добавляет голос в буфер опроса.
-// Возвращает:
-//   - flush — готовый к отправке батч (если достигнут batchSize), иначе nil;
-//   - closed — true, если опрос уже закрыт (голос не принят).
-func (b *voteBuffer) Add(pollID string, v model.Vote) (flush []model.Vote, closed bool) {
+// Возвращает false, если опрос закрыт (голос не принят).
+func (b *voteBuffer) Add(pollID string, v model.Vote) (accepted bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	pb := b.polls[pollID]
-	if pb == nil {
-		pb = &pollBuffer{}
-		b.polls[pollID] = pb
-	}
+	pb := b.pollLocked(pollID)
 	if pb.closed {
-		return nil, true
+		return false
 	}
 	pb.votes = append(pb.votes, v)
 	if len(pb.votes) >= b.batchSize {
-		flush = pb.votes
+		pb.out = append(pb.out, outMsg{votes: pb.votes})
 		pb.votes = nil
 	}
-	return flush, false
+	b.ensureDrainerLocked(pollID, pb)
+	return true
 }
 
-// Close закрывает опрос. Возвращает остаток голосов (для досылки) и признак
-// alreadyClosed — true, если опрос был закрыт ранее (идемпотентность: "done"
-// должен уйти ровно один раз).
-func (b *voteBuffer) Close(pollID string, now time.Time) (flush []model.Vote, alreadyClosed bool) {
+// Close закрывает опрос: ставит в очередь остаток голосов и "done".
+// Возвращает alreadyClosed=true, если опрос был закрыт ранее (идемпотентность:
+// "done" уходит ровно один раз).
+func (b *voteBuffer) Close(pollID string, now time.Time) (alreadyClosed bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	pb := b.polls[pollID]
-	if pb == nil {
-		pb = &pollBuffer{}
-		b.polls[pollID] = pb
-	}
+	pb := b.pollLocked(pollID)
 	if pb.closed {
-		return nil, true
+		return true
 	}
 	pb.closed = true
 	pb.closedAt = now
-	flush = pb.votes
-	pb.votes = nil
-	return flush, false
+	if len(pb.votes) > 0 {
+		pb.out = append(pb.out, outMsg{votes: pb.votes})
+		pb.votes = nil
+	}
+	pb.out = append(pb.out, outMsg{done: true})
+	b.ensureDrainerLocked(pollID, pb)
+	return false
+}
+
+// ensureDrainerLocked запускает drainer опроса (один раз) и будит его, если он
+// уже работает. Вызывается под удерживаемым мьютексом.
+func (b *voteBuffer) ensureDrainerLocked(pollID string, pb *pollBuffer) {
+	if pb.draining {
+		select {
+		case pb.wake <- struct{}{}:
+		default:
+		}
+		return
+	}
+	pb.draining = true
+	pb.wake = make(chan struct{}, 1)
+	go b.drain(pollID, pb)
+}
+
+// drain последовательно отправляет исходящую очередь опроса. Гарантирует, что
+// вызывающий send() получает элементы в порядке добавления. Завершается, когда
+// опрос закрыт и очередь пуста.
+func (b *voteBuffer) drain(pollID string, pb *pollBuffer) {
+	for {
+		b.mu.Lock()
+		if len(pb.out) == 0 {
+			closed := pb.closed
+			b.mu.Unlock()
+			if closed {
+				return
+			}
+			<-pb.wake
+			continue
+		}
+		msg := pb.out[0]
+		pb.out = pb.out[1:]
+		b.mu.Unlock()
+
+		if b.send != nil {
+			b.send(pollID, msg.votes, msg.done)
+		}
+	}
 }
 
 // PollIDs возвращает список известных буферу опросов (для фонового watcher'а).
@@ -97,7 +164,9 @@ func (b *voteBuffer) Cleanup(ttl time.Duration, now time.Time) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	for id, pb := range b.polls {
-		if pb.closed && now.Sub(pb.closedAt) > ttl {
+		// Удаляем только когда очередь уже разобрана drainer'ом, иначе
+		// потеряем неотправленные элементы.
+		if pb.closed && len(pb.out) == 0 && now.Sub(pb.closedAt) > ttl {
 			delete(b.polls, id)
 		}
 	}
