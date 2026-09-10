@@ -1,0 +1,9 @@
+# Сборка для Linux-стенда: готовые бинарники (linux/amd64) уже лежат в ./bin.
+# Так не нужен доступ к golang-образу и сетевым пакетным репозиториям на стенде.
+# wget/busybox в alpine уже есть — healthcheck работает без apk add.
+FROM alpine:3.20
+
+ARG SERVICE=results
+WORKDIR /app
+COPY bin/${SERVICE} /app/bin/${SERVICE}
+# entrypoint задаётся в compose (имя бинарника зависит от сервиса)

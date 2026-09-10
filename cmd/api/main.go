@@ -7,6 +7,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"strings"
@@ -79,6 +80,21 @@ func run(logger *slog.Logger) error {
 	}, logger)
 
 	go server.StartWatcher(ctx, closeCheck)
+
+	// Опциональный pprof-сервер для профилирования под нагрузкой.
+	if pprofAddr := config.String("PPROF_ADDR", ""); pprofAddr != "" {
+		pprofServer := &http.Server{
+			Addr:              pprofAddr,
+			Handler:           http.DefaultServeMux,
+			ReadHeaderTimeout: 5 * time.Second,
+		}
+		go func() {
+			logger.Info("pprof listening", "addr", pprofAddr)
+			if err := pprofServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				logger.Error("pprof server error", "err", err)
+			}
+		}()
+	}
 
 	httpServer := &http.Server{
 		Addr:              httpAddr,

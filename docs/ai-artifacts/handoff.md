@@ -21,8 +21,15 @@ e2e и нагрузочный прогон выполнены.
 
 - Все интеграционные тесты проходят: `go test -race ./...`
 - E2E в Docker: `KEEP=1 ./scripts/e2e.sh` — пройден
-- Нагрузочный тест: `make loadtest` (сценарный, 3 мин / 15 опросов по 30 с) —
-  599 973 голоса принято = 599 973 учтено, 15/15 OK, workers 2/2
+- Нагрузочный тест: `make loadtest` (сценарный) — 599 973 принято = 599 973 учтено,
+  15/15 OK, workers 2/2
+- **Пиковая пропускная способность (Linux-стенд cl1): ~88 000 RPS**, 0 потерь
+  (300 000/300 000). Оптимизации дали +50% (58K → 88K). Узкое место — stdlib
+  `net/http` (76% CPU), наш код — 16%. Подробности: `docs/performance.md`.
+- **Замеры только на Linux!** Docker Desktop на macOS даёт потолок ~12K RPS
+  из-за виртуализации сети. Стенд: `ssh cl1`, проект в `~/highload-poll-backend`,
+  запуск через `docker-compose.server.yml` (образы `hp-*` собраны из `./bin`).
+  Скрипты: `scripts/deploy-cl1.sh`, `scripts/bench-remote.sh`.
 
 ## Что где лежит
 
@@ -37,6 +44,10 @@ internal/api/issued.go                — лимит выдачи cookie (счё
 internal/fingerprint                  — cookie (HMAC) + sha256(IP)
 internal/model, config, httpx, uuid   — общие пакеты
 specs/                                — контракты (api, consumer, results)
+docs/performance.md                   — замеры производительности и оптимизации
+docker-compose.server.yml             — запуск стека на Linux-стенде cl1
+Dockerfile.server                     — образ из готовых бинарников (linux/amd64)
+scripts/deploy-cl1.sh, bench-remote.sh— деплой и замеры на стенде
 migrations/001_init.sql               — схема polls
 loadtest/                             — сценарный нагрузочный тест (Go)
 scripts/e2e.sh                        — e2e-проверка

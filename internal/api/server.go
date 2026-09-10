@@ -210,8 +210,13 @@ func (s *Server) handleVote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	httpx.WriteJSON(w, http.StatusAccepted, model.VoteResponse{Status: "accepted"})
+	// Ответ на успешный голос постоянен — отдаём предвычисленный JSON,
+	// не тратя CPU на сериализацию на каждом запросе (hot path).
+	httpx.WriteJSONBytes(w, http.StatusAccepted, acceptedResponse)
 }
+
+// acceptedResponse — постоянный ответ на принятый голос.
+var acceptedResponse = []byte(`{"status":"accepted"}` + "\n")
 
 // handleHealthz — GET /healthz.
 func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {

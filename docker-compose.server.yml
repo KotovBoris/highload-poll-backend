@@ -1,24 +1,31 @@
-# ===== highload-poll-backend: локальный запуск =====
+# ===== highload-poll-backend: запуск на Linux-стенде (cl1) =====
 #
-# Основной профиль: results + postgres + kafka + api + consumer.
-# Нагрузочный тест запускается отдельно: make loadtest
+# Отличия от локального docker-compose.yml:
+#  - образы сервисов собираются на ноуте под linux/amd64 и берутся из ./bin
+#    (Dockerfile.server копирует готовые бинарники, без golang-этапа);
+#  - порты сдвинуты (18080/18081/18082), чтобы не конфликтовать с чужими
+#    контейнерами на стенде;
+#  - pprof выключен по умолчанию (включай через PPROF_ADDR при отладке).
 #
-# Пароль локальной БД — только для dev-окружения.
+# Запуск: sudo docker compose -f docker-compose.server.yml -p hp up -d
 
-name: highload-poll
+name: hp
 
 services:
   postgres:
     image: postgres:16-alpine
+    # Дефолтный seccomp-профиль Docker 24 на ядре 6.1 блокирует syscalls
+    # postgres ("Operation not permitted" при initdb). На стенде снимаем.
+    security_opt:
+      - seccomp=unconfined
     environment:
       POSTGRES_USER: poll
       POSTGRES_DB: poll
-      # Локальный dev: без пароля, доступ только внутри compose-сети.
       POSTGRES_HOST_AUTH_METHOD: trust
-    ports:
-      - "5432:5432"
-    volumes:
-      - pgdata:/var/lib/postgresql/data
+    # Данные в tmpfs: на стенде named volume не даёт писать (Operation not
+    # permitted на этой ФС), а для нагрузочного теста персистентность не нужна.
+    tmpfs:
+      - /var/lib/postgresql/data:size=2g
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U poll -d poll"]
       interval: 2s
@@ -27,10 +34,9 @@ services:
 
   kafka:
     image: apache/kafka:3.8.0
-    ports:
-      - "9092:9092"
+    security_opt:
+      - seccomp=unconfined
     environment:
-      # --- KRaft (без Zookeeper) ---
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
@@ -44,9 +50,10 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
-      # Retention 5 минут для топика votes (см. архитектуру).
       KAFKA_LOG_RETENTION_MS: 300000
       CLUSTER_ID: "highload-poll-kraft-01"
+      # Под нагрузкой Kafka пишет много; даём ей больше памяти кучи.
+      KAFKA_HEAP_OPTS: "-Xmx2g -Xms1g"
     healthcheck:
       test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
       interval: 5s
@@ -55,8 +62,9 @@ services:
       start_period: 20s
 
   results:
-    build:
-      context: .
+    image: hp-results
+    security_opt:
+      - seccomp=unconfined
     entrypoint: ["/app/bin/results"]
     environment:
       HTTP_ADDR: ":8081"
@@ -66,7 +74,7 @@ services:
     volumes:
       - ./migrations:/app/migrations:ro
     ports:
-      - "8081:8081"
+      - "18081:8081"
     depends_on:
       postgres:
         condition: service_healthy
@@ -78,8 +86,9 @@ services:
       start_period: 5s
 
   api:
-    build:
-      context: .
+    image: hp-api
+    security_opt:
+      - seccomp=unconfined
     entrypoint: ["/app/bin/api"]
     environment:
       HTTP_ADDR: ":8080"
@@ -89,17 +98,16 @@ services:
       VOTE_BATCH_SIZE: "10000"
       POLL_CACHE_TTL: "1m"
       CLOSE_CHECK_INTERVAL: "500ms"
-      # Секрет HMAC-подписи cookie. В проде задаётся из секрет-хранилища.
       COOKIE_SECRET: "dev-cookie-secret-change-me"
       MAX_ISSUED_ENTRIES: "1000000"
-      # Сколько cookie можно выдать одному IP в рамках опроса. Значение
-      # рассчитано на CGNAT мобильных операторов (сотни устройств за IP).
       MAX_COOKIES_PER_CLIENT: "1000"
       DISABLE_ISSUE_LIMIT: "false"
       PPROF_ADDR: ":6060"
+      # Реже запускать GC: под нагрузкой видно заметную долю в madvise/span scan.
+      # Меняем порог с дефолтных 100% до 400% — обмен памяти на пропускную способность.
+      GOGC: "400"
     ports:
-      - "8080:8080"
-      - "6060:6060"
+      - "18080:8080"
     depends_on:
       kafka:
         condition: service_healthy
@@ -112,11 +120,10 @@ services:
       retries: 30
       start_period: 5s
 
-  # Второй API-воркер: нужен, чтобы проверить, что consumer дожидается "done"
-  # от НЕСКОЛЬКИХ воркеров (каждый шлёт свои голоса и свой done).
   api2:
-    build:
-      context: .
+    image: hp-api
+    security_opt:
+      - seccomp=unconfined
     entrypoint: ["/app/bin/api"]
     environment:
       HTTP_ADDR: ":8080"
@@ -130,8 +137,9 @@ services:
       MAX_ISSUED_ENTRIES: "1000000"
       MAX_COOKIES_PER_CLIENT: "1000"
       DISABLE_ISSUE_LIMIT: "false"
+      GOGC: "400"
     ports:
-      - "8083:8080"
+      - "18083:8080"
     depends_on:
       kafka:
         condition: service_healthy
@@ -145,8 +153,9 @@ services:
       start_period: 5s
 
   consumer:
-    build:
-      context: .
+    image: hp-consumer
+    security_opt:
+      - seccomp=unconfined
     entrypoint: ["/app/bin/consumer"]
     environment:
       KAFKA_BROKERS: "kafka:9092"
@@ -154,17 +163,10 @@ services:
       KAFKA_GROUP_ID: "poll-consumers"
       RESULTS_URL: "http://results:8081"
       HTTP_ADDR: ":8082"
-      # Пауза после ends_at перед завершением опроса. НЕ ставить в 0 при
-      # нескольких API-воркерах: кворум считается по ИЗВЕСТНЫМ воркерам, и при
-      # grace=0 consumer завершит опрос по "done" первого воркера, не дождавшись
-      # остальных — их голоса теряются (проверено: теряется ~половина).
-      # 1s хватает локально; в проде рекомендуется ~30s либо heartbeat (см. docs).
       CLOSE_GRACE: "1s"
       CLOSE_HARD_TIMEOUT: "1m"
       COMMIT_DONE_PERCENT: "90"
       COMMIT_STALE_MESSAGES: "1000"
-    ports:
-      - "8082:8082"
     depends_on:
       kafka:
         condition: service_healthy
@@ -176,6 +178,3 @@ services:
       timeout: 3s
       retries: 30
       start_period: 5s
-
-volumes:
-  pgdata:
