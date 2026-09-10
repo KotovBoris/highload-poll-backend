@@ -9,114 +9,81 @@
 **Репозиторий:** https://github.com/KotovBoris/highload-poll-backend
 **Локально:** `/Users/b.kotov/personal/highload-poll-backend`
 **gh:** `/opt/homebrew/bin/gh` (не в PATH, вызывать по полному пути)
-**Аккаунт GitHub:** KotovBoris (SSH)
+
+> Важно: в этом окружении `/bin/sh` стартует с PATH `/usr/bin:/bin:/usr/sbin:/sbin`.
+> Go и Docker лежат в `/opt/homebrew/bin` — перед командами делать
+> `export PATH="/opt/homebrew/bin:$PATH"`.
 
 ## Текущее состояние
 
-Архитектура спроектирована и зафиксирована в документах. **Кода ещё нет.**
-Нужно переходить к реализации.
+**Реализация завершена.** Архитектура спроектирована, код написан, тесты зелёные,
+e2e и нагрузочный прогон выполнены.
 
-## Документы архитектуры (читать в порядке)
+- Все интеграционные тесты проходят: `go test -race ./...`
+- E2E в Docker: `KEEP=1 ./scripts/e2e.sh` — пройден
+- Нагрузочный тест: `go run ./loadtest` — ~12–16K RPS, 0 ошибок, p99 40–66 ms
 
-1. [`docs/architecture/01-load-estimation.md`](../architecture/01-load-estimation.md) — оценка нагрузки (оптимистичная: p=5%, k=4, M=10, ~3.3M RPS)
-2. [`docs/architecture/02-product-assumptions.md`](../architecture/02-product-assumptions.md) — продуктовые допущения (результаты не публичные, не real-time, асинхронная дедупликация, durability не критична)
-3. [`docs/architecture/03-deduplication.md`](../architecture/03-deduplication.md) — fingerprint: cookie primary + IP+UA fallback
-4. [`docs/architecture/04-architecture.md`](../architecture/04-architecture.md) — **итоговая архитектура + история решений (главный документ)**
-5. [`docs/architecture/05-layer-load.md`](../architecture/05-layer-load.md) — RPS/MB/RAM/CPU по слоям
-
-## Архитектура (кратко)
+## Что где лежит
 
 ```
-Зритель → API-воркеры (Go) → Kafka → Consumer'ы (Go) → Сервис результатов (Go + PostgreSQL)
+cmd/api, cmd/consumer, cmd/results   — точки входа сервисов
+internal/api                          — буфер, кэш (single-flight), sender, хендлеры
+internal/consumer                     — дедуп, завершение, контигуальный коммит
+internal/results                      — storage-интерфейс, хендлеры, PostgreSQL
+internal/kafka                        — Producer/Reader интерфейсы + segmentio
+internal/resultsclient                — HTTP-клиент к internal API results
+internal/fingerprint                  — cookie + sha256(IP|UA)
+internal/model, config, httpx, uuid   — общие пакеты
+specs/                                — контракты (api, consumer, results)
+migrations/001_init.sql               — схема polls
+loadtest/                             — нагрузочный тест (Go)
+scripts/e2e.sh                        — e2e-проверка
+plans/implementation-plan.md          — план реализации
 ```
 
-### Компоненты
+## Ключевые решения
 
-| Компонент | Технология | Роль |
-|---|---|---|
-| API-воркеры | Go (net/http) | Приём голосов, выдача cookie, буфер 10K, produce в Kafka |
-| Kafka | Kafka (KRaft) | Буфер пика, durability, key=poll_id |
-| Consumer'ы | Go | Локальная дедупликация in-memory, подсчёт, flush результатов |
-| Сервис результатов | Go + PostgreSQL | Метаданные опросов, итоговые результаты, админка |
+1. **Батч голосов = одно Kafka-сообщение** (10K, ~370KB), `key = poll_id`.
+2. **Дедупликация асинхронная** — в consumer'е (in-memory map), не на hot path.
+3. **Offset не коммитится до завершения опроса**; flush идемпотентен
+   (`UPDATE ... WHERE status != 'completed'`).
+4. **Контигуальный коммит offset** по партиции — коммитится только непрерывный
+   префикс завершённых опросов (защита от потери данных при нескольких poll_id
+   в партиции).
+5. **Завершение опроса:** «done» от воркеров + пороги (кворум Y%, остывание X
+   сообщений, жёсткий таймаут). API-воркер шлёт «done» после `ends_at`.
+6. **Fingerprint:** cookie `voter_id` (UUID) primary, `sha256(IP|UA)` fallback.
+7. **Пробел архитектуры закрыт:** results отдаёт `GET /internal/polls/{id}`
+   (метаданные + `ends_at`) для API и consumer.
 
-### Ключевые решения
+## Добавления к исходной архитектуре (нужно знать)
 
-1. **Батчинг:** API-воркеры накапливают 10K голосов на опрос, затем batch produce в Kafka.
-2. **Kafka-сообщение = батч голосов** (10K, ~370KB), poll_id один раз. Не одно сообщение = один голос.
-3. **Дедупликация асинхронная** — в consumer'е, не на hot path.
-4. **Локальная дедупликация в consumer'е** (in-memory map), без Redis. key=poll_id → одна партиция → один consumer.
-5. **Consumer не коммитит offset до завершения опроса.** При падении — полный replay, идемпотентный flush.
-6. **Идемпотентный flush:** `WHERE status != 'completed'` — двойного счёта нет.
-7. **Fingerprint:** cookie (как есть, UUID) primary + hash(IP+UA) fallback.
-8. **Завершение опроса:** worker_id в каждом сообщении → consumer собирает множество worker_id → после ends_at ждёт "done" от каждого → порог коммита: ≥Y% "done" ИЛИ X сообщений по другим poll_id.
-9. **При недоступности Kafka:** API-воркер retry до посинения (уже ответил зрителю OK). Минус: можем потерять голоса.
-10. **Kafka consumer настройки:** `max.poll.interval.ms` = 600000 (10 мин), `session.timeout.ms` = 60000.
+- `GET /internal/polls/{id}` — метаданные + `ends_at` (API и consumer).
+- `POST /internal/polls/{id}/results` — идемпотентный flush (200 `written:true`
+  / 409 `written:false`).
+- **Контигуальный коммит offset** — в архитектуре был описан абстрактно; при
+  реализации выяснилось, что при нескольких `poll_id` в одной партиции нельзя
+  коммитить «завершённые» сообщения в отрыве от незавершённых. Реализовано через
+  очередь pending-сообщений на партицию и коммит непрерывного префикса.
+  **Рекомендуется перенести этот пункт в `04-architecture.md`.**
+- Пароль PostgreSQL для локального dev не используется (trust-аутентификация) —
+  санитайзер окружения затирает literal-пароли в compose.
 
-### API (предварительно)
+## Что можно улучшить (не сделано)
 
-- `GET /polls/{id}` — страница опроса, выдача cookie
-- `POST /polls/{id}/vote` — принять голос
-- `POST /admin/polls` — создать опрос (админка)
-- `GET /admin/polls/{id}/results` — посмотреть результаты (админка)
-
-### Kafka
-
-- Топик: `votes`
-- key: `poll_id`
-- Одно сообщение = батч голосов (JSON): `{"poll_id":"...","worker_id":"...","votes":[{"fingerprint":"...","option_id":N},...]}`
-- "done" сообщение: `{"poll_id":"...","worker_id":"...","done":true}`
-- Компрессия: LZ4
-- Retention: 5 мин
-
-### PostgreSQL
-
-- Таблица `polls`: id, question, options (JSON), status, results (JSON), created_at, ends_at
-- Идемпотентный flush: `UPDATE polls SET status='completed', results=$1 WHERE id=$2 AND status!='completed'`
-
-## Что нужно сделать (реализация)
-
-1. **Структура Go-проекта** (monorepo или модули):
-   - `cmd/api/` — API-воркеры
-   - `cmd/consumer/` — Consumer'ы
-   - `cmd/results/` — Сервис результатов (админка)
-   - `internal/` — общие пакеты
-
-2. **Docker Compose** для локального запуска: Kafka (KRaft) + PostgreSQL + все сервисы.
-
-3. **API-воркер:**
-   - HTTP-сервер (net/http или chi/gin)
-   - Выдача cookie (UUID)
-   - In-memory буфер 10K голосов на poll_id
-   - Kafka producer (segmentio/kafka-go или sarama)
-   - После ends_at: 403 + дослать "done"
-
-4. **Consumer:**
-   - Kafka consumer (consumer group)
-   - In-memory map[fingerprint]bool для дедупликации
-   - In-memory счётчики
-   - Сбор worker_id, ожидание "done"
-   - Идемпотентный flush в сервис результатов
-   - Commit offset после OK от сервиса
-
-5. **Сервис результатов:**
-   - HTTP-сервер (админка)
-   - PostgreSQL (создание опросов, сохранение результатов)
-   - `GET /polls/{id}` для consumer'а (получить ends_at)
-
-6. **Тестирование:**
-   - Нагрузочный тест (хотя бы базовый)
-   - Unit-тесты ключевой логики
-
-7. **README:** как запустить локально и протестировать.
+- Публикация результатов зрителям (не требовалась — см. продуктовые допущения).
+- WAL/файловый фоллбэк при недоступности Kafka (описан в архитектуре как будущее).
+- Метрики Prometheus / трейсинг.
+- Аутентификация админки (сейчас без неё — по условиям тестового задания).
+- Нагрузочные тесты с реальным распределением по партициям (сейчас 1 партиция).
 
 ## Лог работ
 
-Ведётся в [`docs/ai-artifacts/work-log.md`](work-log.md) — добавляй туда шаги.
+Ведётся в [`docs/ai-artifacts/work-log.md`](work-log.md).
 
 ## Важные замечания
 
-- Пользователь хочет видеть **обоснование архитектуры** в репозитории (уже есть в `04-architecture.md`).
-- Все артефакты работы с ИИ — в `docs/ai-artifacts/`.
-- Пользователь шарит за Go, можно не объяснять базовые вещи.
-- Коммиты — на английском, с префиксом `docs(arch):`, `feat:`, `fix:` и т.д.
-- Пользователь предпочитает обсуждать архитектурные решения **до** их записи в документ.
+- Пользователь шарит за Go, базовые вещи не объяснять.
+- Коммиты — на английском, с префиксами `feat:`, `fix:`, `docs:`, `test:`, `chore:`.
+- Архитектурные решения обсуждать **до** записи в документ.
+- Артефакты работы с ИИ — в `docs/ai-artifacts/`.

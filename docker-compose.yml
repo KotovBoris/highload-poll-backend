@@ -1,0 +1,135 @@
+# ===== highload-poll-backend: локальный запуск =====
+#
+# Основной профиль: results + postgres + kafka + api + consumer.
+# Нагрузочный тест запускается отдельно: make loadtest
+#
+# Пароль локальной БД — только для dev-окружения.
+
+name: highload-poll
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: poll
+      POSTGRES_DB: poll
+      # Локальный dev: без пароля, доступ только внутри compose-сети.
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U poll -d poll"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  kafka:
+    image: apache/kafka:3.8.0
+    ports:
+      - "9092:9092"
+    environment:
+      # --- KRaft (без Zookeeper) ---
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      # Retention 5 минут для топика votes (см. архитектуру).
+      KAFKA_LOG_RETENTION_MS: 300000
+      CLUSTER_ID: "highload-poll-kraft-01"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 20s
+
+  results:
+    build:
+      context: .
+    entrypoint: ["/app/bin/results"]
+    environment:
+      HTTP_ADDR: ":8081"
+      DATABASE_URL: "postgres://poll@postgres:5432/poll?sslmode=disable"
+      MIGRATIONS_DIR: "/app/migrations"
+      DB_MAX_CONNS: "20"
+    volumes:
+      - ./migrations:/app/migrations:ro
+    ports:
+      - "8081:8081"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8081/healthz || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+  api:
+    build:
+      context: .
+    entrypoint: ["/app/bin/api"]
+    environment:
+      HTTP_ADDR: ":8080"
+      KAFKA_BROKERS: "kafka:9092"
+      KAFKA_TOPIC: "votes"
+      RESULTS_URL: "http://results:8081"
+      VOTE_BATCH_SIZE: "10000"
+      POLL_CACHE_TTL: "1m"
+      CLOSE_CHECK_INTERVAL: "500ms"
+    ports:
+      - "8080:8080"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      results:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/healthz || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+  consumer:
+    build:
+      context: .
+    entrypoint: ["/app/bin/consumer"]
+    environment:
+      KAFKA_BROKERS: "kafka:9092"
+      KAFKA_TOPIC: "votes"
+      KAFKA_GROUP_ID: "poll-consumers"
+      RESULTS_URL: "http://results:8081"
+      HTTP_ADDR: ":8082"
+      CLOSE_GRACE: "5s"
+      CLOSE_HARD_TIMEOUT: "1m"
+      COMMIT_DONE_PERCENT: "90"
+      COMMIT_STALE_MESSAGES: "1000"
+    ports:
+      - "8082:8082"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      results:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8082/healthz || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+volumes:
+  pgdata:
