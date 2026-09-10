@@ -15,21 +15,28 @@ import (
 	"github.com/KotovBoris/highload-poll-backend/internal/httpx"
 	"github.com/KotovBoris/highload-poll-backend/internal/model"
 	"github.com/KotovBoris/highload-poll-backend/internal/resultsclient"
-	"github.com/KotovBoris/highload-poll-backend/internal/uuid"
 )
 
 // cookieMaxAge — время жизни cookie voter_id.
 const cookieMaxAge = 24 * time.Hour
+
+// issueTTLGrace — на сколько после ends_at опроса помнить факт выдачи cookie.
+// После этого запись лимитера удаляется.
+const issueTTLGrace = 10 * time.Minute
 
 // Server — HTTP-сервер API-воркера.
 type Server struct {
 	cache    *pollCache
 	buf      *voteBuffer
 	sender   *Sender
+	signer   *fingerprint.Signer
+	limiter  *issueLimiter
 	workerID string
 	logger   *slog.Logger
 	now      func() time.Time
 	closeTTL time.Duration
+	// limitIssuing выключает лимит выдачи (для нагрузочных тестов).
+	limitIssuing bool
 }
 
 // Config — параметры сервера.
@@ -39,6 +46,12 @@ type Config struct {
 	CacheTTL  time.Duration
 	// CloseTTL — через сколько после закрытия удалять буфер опроса.
 	CloseTTL time.Duration
+	// CookieSecret — секрет HMAC-подписи cookie. Пустой — случайный (dev).
+	CookieSecret string
+	// MaxIssuedEntries — предел числа записей лимитера выдачи. 0 — без предела.
+	MaxIssuedEntries int
+	// DisableIssueLimit отключает лимит выдачи (используется нагрузочным тестом).
+	DisableIssueLimit bool
 }
 
 // NewServer создаёт сервер.
@@ -55,15 +68,25 @@ func NewServer(client resultsclient.Client, sender *Sender, cfg Config, logger *
 	if cfg.CloseTTL <= 0 {
 		cfg.CloseTTL = cfg.CacheTTL
 	}
+	var signer *fingerprint.Signer
+	if cfg.CookieSecret != "" {
+		signer = fingerprint.NewSigner(cfg.CookieSecret)
+	} else {
+		signer = fingerprint.NewRandomSigner()
+		logger.Warn("COOKIE_SECRET is empty: using random secret, cookies will not survive restart")
+	}
 	now := time.Now
 	return &Server{
-		cache:    newPollCache(client, cfg.CacheTTL, now),
-		buf:      newVoteBuffer(cfg.BatchSize),
-		sender:   sender,
-		workerID: cfg.WorkerID,
-		logger:   logger,
-		now:      now,
-		closeTTL: cfg.CloseTTL,
+		cache:        newPollCache(client, cfg.CacheTTL, now),
+		buf:          newVoteBuffer(cfg.BatchSize),
+		sender:       sender,
+		signer:       signer,
+		limiter:      newIssueLimiter(cfg.MaxIssuedEntries, now),
+		workerID:     cfg.WorkerID,
+		logger:       logger,
+		now:          now,
+		closeTTL:     cfg.CloseTTL,
+		limitIssuing: !cfg.DisableIssueLimit,
 	}
 }
 
@@ -71,6 +94,7 @@ func NewServer(client resultsclient.Client, sender *Sender, cfg Config, logger *
 func (s *Server) SetNow(now func() time.Time) {
 	s.now = now
 	s.cache.now = now
+	s.limiter.now = now
 }
 
 // Handler возвращает маршрутизатор.
@@ -82,7 +106,11 @@ func (s *Server) Handler() http.Handler {
 	return mux
 }
 
-// handleGetPoll — GET /polls/{id}: метаданные опроса + cookie voter_id.
+// handleGetPoll — GET /polls/{id}: метаданные опроса + подписанная cookie.
+//
+// Cookie выдаётся только если её ещё нет и если для пары (poll_id, IP+UA)
+// cookie ранее не выдавалась. Повторная выдача для той же пары — 429: это
+// отсекает массовый «фарм» валидных cookie через многократные GET.
 func (s *Server) handleGetPoll(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	poll, err := s.cache.get(r.Context(), id)
@@ -91,11 +119,18 @@ func (s *Server) handleGetPoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Выдаём cookie только если её ещё нет — не перезаписываем существующую.
-	if _, err := r.Cookie(fingerprint.CookieName); err != nil {
+	// Если у клиента уже есть cookie — повторно не выдаём (страница
+	// перезагружается, но новых cookie не появляется).
+	if _, has := fingerprint.CookieValue(r); !has {
+		if s.limitIssuing && !s.allowIssue(id, r, poll) {
+			httpx.WriteError(w, http.StatusTooManyRequests, httpx.ErrTooMany,
+				"voter cookie already issued for this poll")
+			return
+		}
+		_, cookieValue := s.signer.Issue(id)
 		http.SetCookie(w, &http.Cookie{
 			Name:     fingerprint.CookieName,
-			Value:    uuid.New(),
+			Value:    cookieValue,
 			Path:     "/",
 			MaxAge:   int(cookieMaxAge.Seconds()),
 			SameSite: http.SameSiteLaxMode,
@@ -105,6 +140,15 @@ func (s *Server) handleGetPoll(w http.ResponseWriter, r *http.Request) {
 
 	poll.Results = nil // результаты не публичны
 	httpx.WriteJSON(w, http.StatusOK, poll)
+}
+
+// allowIssue регистрирует выдачу cookie по ключу (poll_id, IP+UA).
+// Возвращает false, если cookie для этой пары уже выдавалась.
+func (s *Server) allowIssue(pollID string, r *http.Request, poll model.Poll) bool {
+	key := issueKey(pollID + "|" + fingerprint.ClientKey(fingerprint.ClientIP(r), r.UserAgent()))
+	// Помним запись до ends_at + запас: после закрытия опроса лимит не нужен.
+	expiresAt := poll.EndsAt.Add(issueTTLGrace)
+	return s.limiter.Allow(key, expiresAt)
 }
 
 // handleVote — POST /polls/{id}/vote.
@@ -137,7 +181,9 @@ func (s *Server) handleVote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fp := fingerprint.FromRequest(r)
+	// Подпись проверяется относительно конкретного опроса: cookie,
+	// выданная для другого опроса, отбрасывается и уходит в fallback.
+	fp := fingerprint.FromRequest(r, id, s.signer)
 	flush, closed := s.buf.Add(id, model.Vote{Fingerprint: fp, OptionID: req.OptionID})
 	if closed {
 		httpx.WriteError(w, http.StatusForbidden, httpx.ErrClosed, "poll closed")

@@ -3,8 +3,12 @@
 //
 // Стратегия (см. docs/architecture/03-deduplication.md):
 //
-//	fingerprint = cookie (voter_id, UUID, как есть)  — если cookie есть
-//	fingerprint = sha256(IP + "|" + User-Agent)      — иначе (fallback)
+//	fingerprint = raw UUID из ПОДПИСАННОЙ cookie   — если подпись валидна
+//	fingerprint = sha256(IP + "|" + User-Agent)    — иначе (fallback)
+//
+// Подпись проверяется относительно конкретного poll_id (см. signature.go),
+// поэтому cookie, выданная для одного опроса, не принимается на другом, а
+// выдуманный вручную UUID отбрасывается и уходит в fallback.
 package fingerprint
 
 import (
@@ -18,15 +22,43 @@ import (
 // CookieName — имя cookie, в которой API-воркер выдаёт идентификатор зрителя.
 const CookieName = "voter_id"
 
-// FromRequest вычисляет fingerprint для входящего HTTP-запроса.
+// Verifier проверяет подпись значения cookie для конкретного опроса.
+type Verifier interface {
+	Verify(pollID, cookieValue string) (raw string, ok bool)
+}
+
+// FromRequest вычисляет fingerprint для входящего HTTP-запроса с проверкой
+// подписи cookie относительно poll_id.
 //
-// Основной источник — cookie voter_id (уникальна для устройства, не зависит
-// от NAT). Если cookie нет, используется fallback sha256(IP + "|" + UA).
-func FromRequest(r *http.Request) string {
+// Если cookie есть и подпись валидна — используется сырой UUID из неё
+// (уникален для устройства, не зависит от NAT). Во всех остальных случаях
+// (cookie нет, подпись не сошлась, формат нарушен) — fallback sha256(IP+UA).
+//
+// Из-за fallback подделка cookie не даёт атакующему ничего сверх «нового
+// IP+UA», а валидные подписанные cookie выдаются однократно на пару
+// (poll_id, IP+UA) — см. internal/api/issued.go.
+func FromRequest(r *http.Request, pollID string, v Verifier) string {
 	if c, err := r.Cookie(CookieName); err == nil && c.Value != "" {
-		return c.Value
+		if raw, ok := v.Verify(pollID, c.Value); ok {
+			return raw
+		}
 	}
 	return HashIPUA(ClientIP(r), r.UserAgent())
+}
+
+// CookieValue возвращает сырое значение cookie voter_id, если она есть.
+// Используется на выдаче, чтобы не перезаписывать уже имеющуюся cookie.
+func CookieValue(r *http.Request) (string, bool) {
+	c, err := r.Cookie(CookieName)
+	if err != nil || c.Value == "" {
+		return "", false
+	}
+	return c.Value, true
+}
+
+// ClientKey строит ключ лимита выдачи: хеш пары (IP, User-Agent) в hex.
+func ClientKey(ip, userAgent string) string {
+	return HashIPUA(ip, userAgent)
 }
 
 // HashIPUA возвращает hex-представление sha256 от "IP|User-Agent".

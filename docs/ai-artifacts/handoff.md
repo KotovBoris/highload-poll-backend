@@ -52,9 +52,14 @@ plans/implementation-plan.md          — план реализации
    в партиции).
 5. **Завершение опроса:** «done» от воркеров + пороги (кворум Y%, остывание X
    сообщений, жёсткий таймаут). API-воркер шлёт «done» после `ends_at`.
-6. **Fingerprint:** cookie `voter_id` (UUID) primary, `sha256(IP|UA)` fallback.
+6. **Fingerprint:** **подписанная** cookie `voter_id` (`<uuid>.<hmac>`, HMAC-SHA256,
+   привязана к `poll_id`) primary, `sha256(IP|UA)` fallback.
 7. **Пробел архитектуры закрыт:** results отдаёт `GET /internal/polls/{id}`
    (метаданные + `ends_at`) для API и consumer.
+8. **Анти-накрутка (уровень 1):** HMAC-подпись cookie + лимит выдачи — одна
+   cookie на пару (poll_id, IP+UA), повторный GET → `429`. Лимит in-memory,
+   локальный для процесса; prod-путь — consistent hashing на балансировщике
+   по `poll_id|IP|UA` (зафиксировано, не реализовано). DDoS-защита вне рамок.
 
 ## Добавления к исходной архитектуре (нужно знать)
 

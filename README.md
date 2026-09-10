@@ -53,8 +53,12 @@ choice, A/B и т.д.) и просим зрителей пройти по QR-к�
   (`WHERE status != 'completed'`) → при падении полный replay без двойного счёта.
 - **Завершение опроса:** API-воркер шлёт «done» после `ends_at`; consumer ждёт
   «done» от известных воркеров, с порогом по кворуму/остыванию и жёстким таймаутом.
-- **Fingerprint:** cookie `voter_id` (UUID) как primary, `sha256(IP|User-Agent)` —
-  fallback.
+- **Fingerprint:** **подписанная** cookie `voter_id` (`<uuid>.<hmac>`, HMAC-SHA256,
+  привязана к `poll_id`) как primary, `sha256(IP|User-Agent)` — fallback.
+- **Анти-накрутка:** подпись cookie (выдуманный UUID не проходит) + лимит выдачи
+  — одна cookie на пару `(poll_id, IP+UA)`, повторный GET → `429`. Осознанно без
+  DDoS-защиты; prod-путь (consistent hashing на балансере) — в
+  [`04-architecture.md`](docs/architecture/04-architecture.md).
 - **Контигуальный коммит offset:** по партиции коммитится только непрерывный
   префикс завершённых опросов — гарантия отсутствия потери данных.
 
@@ -77,6 +81,9 @@ choice, A/B и т.д.) и просим зрителей пройти по QR-к�
 | `GET` | `/polls/{id}` | Метаданные опроса, выдача cookie `voter_id` |
 | `POST` | `/polls/{id}/vote` | Голос `{"option_id": N}` → `202`; `400`/`403`/`404` |
 | `GET` | `/healthz` | Healthcheck |
+
+`GET /polls/{id}` выдаёт подписанную cookie; повторная выдача для той же пары
+`(poll_id, IP+UA)` → `429`.
 
 ### Админка (Results, :8081)
 
@@ -141,8 +148,11 @@ make test-integration  # только интеграционные (api, results
 
 - **results** — создание/валидация опросов, идемпотентный flush (200/409),
   скрытие результатов во внутреннем API, healthz.
-- **api** — выдача cookie, fingerprint (cookie/fallback), `202/400/403/404`,
-  бэтчинг по 10K, «done» после закрытия ровно один раз, retry продюсера.
+- **fingerprint** — подпись/проверка HMAC, привязка к `poll_id`, отказ на
+  подделку и чужой опрос, fallback на IP+UA.
+- **api** — выдача подписанной cookie, лимит выдачи (`429`), fingerprint
+  (валидная cookie/подделка/fallback), `202/400/403/404`, бэтчинг по 10K,
+  «done» после закрытия ровно один раз, retry продюсера.
 - **consumer** — дедупликация, кворум «done», остывание, жёсткий таймаут,
   идемпотентный flush при 409, отсутствие коммита при ошибке, контигуальный
   коммит нескольких опросов в одной партиции, битые сообщения.
@@ -195,12 +205,12 @@ cmd/
   consumer/    consumer голосов
   results/     сервис результатов
 internal/
-  api/         буфер, кэш метаданных (single-flight), sender, HTTP-хендлеры
+  api/         буфер, кэш метаданных (single-flight), sender, лимит выдачи, HTTP-хендлеры
   consumer/    дедупликация, завершение, контигуальный коммит
   results/     storage-интерфейс, HTTP-хендлеры, PostgreSQL, миграции
   kafka/       обёртки Producer/Reader над segmentio/kafka-go
   resultsclient/  HTTP-клиент к внутреннему API results
-  fingerprint/ стратегия fingerprint
+  fingerprint/ стратегия fingerprint + HMAC-подпись cookie
   model/       доменные структуры и форматы обмена
   config/      чтение env
   httpx/       JSON-хелперы и единый формат ошибок
@@ -225,6 +235,9 @@ docs/          архитектура и артефакты работы с ИИ
 | `KAFKA_TOPIC` | `votes` | api, consumer |
 | `VOTE_BATCH_SIZE` | `10000` | api |
 | `POLL_CACHE_TTL` | `1m` | api |
+| `COOKIE_SECRET` | — (пусто → случайный) | api |
+| `MAX_ISSUED_ENTRIES` | `1000000` | api |
+| `DISABLE_ISSUE_LIMIT` | `false` | api |
 | `COMMIT_DONE_PERCENT` | `90` | consumer |
 | `CLOSE_GRACE` | `30s` / `5s` в compose | consumer |
 

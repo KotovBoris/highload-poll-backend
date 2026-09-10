@@ -49,7 +49,17 @@ log "GET /polls/{id} — получаю cookie..."
 POLL_JSON=$(curl -sf "$API_URL/polls/$POLL_ID" -c /tmp/e2e_cookie.txt)
 echo "$POLL_JSON" | jq -e '.options | length == 3' >/dev/null || fail "ожидалось 3 опции"
 grep -q voter_id /tmp/e2e_cookie.txt || fail "cookie voter_id не выдана"
-log "Cookie получена."
+
+# cookie должна быть подписанной: "<raw>.<hex-hmac>"
+COOKIE_VAL=$(awk '/voter_id/{print $7}' /tmp/e2e_cookie.txt)
+echo "$COOKIE_VAL" | grep -qE '^[0-9a-f-]+\.[0-9a-f]{64}$' \
+  || fail "cookie не подписана (ожидался формат <uuid>.<hmac>): $COOKIE_VAL"
+log "Cookie получена и подписана."
+
+# --- 2b. Повторный GET без cookie => 429 (лимит выдачи) ---
+CODE=$(curl -s -o /dev/null -w '%{http_code}' "$API_URL/polls/$POLL_ID")
+[ "$CODE" = "429" ] || fail "повторная выдача cookie: ожидался 429, получен $CODE"
+log "Лимит выдачи cookie работает (429)."
 
 # --- 3. Голосование разными fingerprint'ами ---
 log "Голосую (уникальные IP + cookie)..."

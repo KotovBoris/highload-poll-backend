@@ -89,6 +89,11 @@ services:
       VOTE_BATCH_SIZE: "10000"
       POLL_CACHE_TTL: "1m"
       CLOSE_CHECK_INTERVAL: "500ms"
+      # Секрет HMAC-подписи cookie. В проде задаётся из секрет-хранилища.
+      COOKIE_SECRET: "dev-cookie-secret-change-me"
+      MAX_ISSUED_ENTRIES: "1000000"
+      # Лимит выдачи cookie включён: одна cookie на пару (poll_id, IP+UA).
+      DISABLE_ISSUE_LIMIT: "false"
     ports:
       - "8080:8080"
     depends_on:

@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/KotovBoris/highload-poll-backend/internal/fingerprint"
 	"github.com/KotovBoris/highload-poll-backend/internal/model"
 	"github.com/KotovBoris/highload-poll-backend/internal/resultsclient"
 )
@@ -166,6 +167,12 @@ func (h *testHarness) addPoll(id string, endsAt time.Time, options ...int) {
 	h.results.polls[id] = poll
 }
 
+// signedCookie возвращает валидную подписанную cookie для опроса pollID
+// с указанным сырым идентификатором.
+func (h *testHarness) signedCookie(pollID, raw string) *http.Cookie {
+	return &http.Cookie{Name: fingerprint.CookieName, Value: h.server.signer.Sign(pollID, raw)}
+}
+
 func postVote(t *testing.T, url string, optionID int, cookie *http.Cookie) (*http.Response, []byte) {
 	t.Helper()
 	body, _ := json.Marshal(model.VoteRequest{OptionID: optionID})
@@ -205,6 +212,10 @@ func TestGetPoll_IssuesCookie(t *testing.T) {
 	}
 	if !cookies[0].HttpOnly {
 		t.Error("cookie should be HttpOnly")
+	}
+	// Выданное значение должно быть валидной подписью для этого опроса.
+	if _, ok := h.server.signer.Verify("p1", cookies[0].Value); !ok {
+		t.Errorf("issued cookie must carry a valid signature, got %q", cookies[0].Value)
 	}
 	// Результаты не должны отдаваться.
 	var poll model.Poll
@@ -307,16 +318,16 @@ func TestVote_Batching(t *testing.T) {
 	h := newHarness(t, Config{BatchSize: 3})
 	h.addPoll("p1", h.clock.now().Add(time.Minute))
 
-	// Два голоса по уникальным fingerprint'ам.
-	postVote(t, h.ts.URL+"/polls/p1/vote", 1, &http.Cookie{Name: "voter_id", Value: "u1"})
-	postVote(t, h.ts.URL+"/polls/p1/vote", 2, &http.Cookie{Name: "voter_id", Value: "u2"})
+	// Два голоса по уникальным подписанным cookie.
+	postVote(t, h.ts.URL+"/polls/p1/vote", 1, h.signedCookie("p1", "u1"))
+	postVote(t, h.ts.URL+"/polls/p1/vote", 2, h.signedCookie("p1", "u2"))
 	// Батч ещё не должен уйти.
 	time.Sleep(50 * time.Millisecond)
 	if n := len(h.producer.snapshot()); n != 0 {
 		t.Fatalf("expected no batches yet, got %d", n)
 	}
 	// Третий голос добивает батч.
-	postVote(t, h.ts.URL+"/polls/p1/vote", 1, &http.Cookie{Name: "voter_id", Value: "u3"})
+	postVote(t, h.ts.URL+"/polls/p1/vote", 1, h.signedCookie("p1", "u3"))
 
 	batches := h.producer.waitFor(t, 1, 2*time.Second)
 	b := batches[0]
@@ -371,8 +382,8 @@ func TestClosePoll_SendsRemainderAndDoneOnce(t *testing.T) {
 	h.addPoll("p1", h.clock.now().Add(time.Minute))
 
 	// Два голоса остаются в буфере (batch size большой).
-	postVote(t, h.ts.URL+"/polls/p1/vote", 1, &http.Cookie{Name: "voter_id", Value: "u1"})
-	postVote(t, h.ts.URL+"/polls/p1/vote", 2, &http.Cookie{Name: "voter_id", Value: "u2"})
+	postVote(t, h.ts.URL+"/polls/p1/vote", 1, h.signedCookie("p1", "u1"))
+	postVote(t, h.ts.URL+"/polls/p1/vote", 2, h.signedCookie("p1", "u2"))
 
 	h.server.closePoll("p1")
 
@@ -398,7 +409,7 @@ func TestSweep_ClosesExpiredPolls(t *testing.T) {
 	h.addPoll("p1", h.clock.now().Add(30*time.Second))
 
 	// Голос, чтобы буфер знал об опросе.
-	postVote(t, h.ts.URL+"/polls/p1/vote", 1, &http.Cookie{Name: "voter_id", Value: "u1"})
+	postVote(t, h.ts.URL+"/polls/p1/vote", 1, h.signedCookie("p1", "u1"))
 
 	// Время ещё не пришло — ничего не закрывается.
 	h.server.sweep()
@@ -431,5 +442,221 @@ func TestSender_RetriesUntilSuccess(t *testing.T) {
 	}
 	if _, failed := s.Stats(); failed == 0 {
 		t.Error("expected failed counter > 0")
+	}
+}
+
+// ---- Подпись cookie ----
+
+// voteFingerprint отправляет голос с указанной cookie и возвращает fingerprint,
+// который дошёл до буфера (через отправленный батч).
+func voteFingerprint(t *testing.T, h *testHarness, pollID string, cookie *http.Cookie, ip, ua string) string {
+	t.Helper()
+	body, _ := json.Marshal(model.VoteRequest{OptionID: 1})
+	req, err := http.NewRequest(http.MethodPost, h.ts.URL+"/polls/"+pollID+"/vote", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if ip != "" {
+		req.Header.Set("X-Forwarded-For", ip)
+	}
+	if ua != "" {
+		req.Header.Set("User-Agent", ua)
+	}
+	if cookie != nil {
+		req.AddCookie(cookie)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("vote status = %d, want 202", resp.StatusCode)
+	}
+
+	batches := h.producer.waitFor(t, 1, 2*time.Second)
+	var last model.VoteBatch
+	for _, b := range batches {
+		if len(b.Votes) > 0 {
+			last = b
+		}
+	}
+	if len(last.Votes) == 0 {
+		t.Fatal("no votes reached the producer")
+	}
+	return last.Votes[len(last.Votes)-1].Fingerprint
+}
+
+func TestVote_ValidSignedCookieIsUsed(t *testing.T) {
+	h := newHarness(t, Config{BatchSize: 1})
+	h.addPoll("p1", h.clock.now().Add(time.Minute))
+
+	got := voteFingerprint(t, h, "p1", h.signedCookie("p1", "raw-uuid-1"), "10.0.0.1", "agent")
+	if got != "raw-uuid-1" {
+		t.Errorf("fingerprint = %q, want raw uuid from cookie", got)
+	}
+}
+
+func TestVote_TamperedCookieFallsBackToIPUA(t *testing.T) {
+	h := newHarness(t, Config{BatchSize: 1})
+	h.addPoll("p1", h.clock.now().Add(time.Minute))
+
+	// Подпись выдумана — должна уйти в fallback.
+	forged := &http.Cookie{Name: fingerprint.CookieName, Value: "attacker-uuid.deadbeefdeadbeef"}
+	got := voteFingerprint(t, h, "p1", forged, "10.0.0.1", "agent")
+
+	want := fingerprint.HashIPUA("10.0.0.1", "agent")
+	if got != want {
+		t.Errorf("fingerprint = %q, want fallback %q", got, want)
+	}
+	if got == "attacker-uuid" {
+		t.Error("forged cookie must not be accepted as-is")
+	}
+}
+
+func TestVote_CookieFromOtherPollFallsBack(t *testing.T) {
+	h := newHarness(t, Config{BatchSize: 1})
+	h.addPoll("p1", h.clock.now().Add(time.Minute))
+	h.addPoll("other", h.clock.now().Add(time.Minute))
+
+	// Cookie подписана для другого опроса — на p1 недействительна.
+	got := voteFingerprint(t, h, "p1", h.signedCookie("other", "raw-uuid-2"), "10.0.0.2", "agent")
+
+	want := fingerprint.HashIPUA("10.0.0.2", "agent")
+	if got != want {
+		t.Errorf("fingerprint = %q, want fallback %q (cookie bound to another poll)", got, want)
+	}
+}
+
+// ---- Лимит выдачи cookie ----
+
+func TestGetPoll_SecondIssueIsLimited(t *testing.T) {
+	h := newHarness(t, Config{})
+	h.addPoll("p1", h.clock.now().Add(time.Minute))
+
+	// Первый GET с данного IP+UA — 200 + cookie.
+	resp1, err := http.Get(h.ts.URL + "/polls/p1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp1.Body.Close()
+	if resp1.StatusCode != http.StatusOK {
+		t.Fatalf("first GET status = %d, want 200", resp1.StatusCode)
+	}
+	if len(resp1.Cookies()) != 1 {
+		t.Fatalf("first GET should issue a cookie")
+	}
+
+	// Второй GET с того же IP+UA (тот же http.Get => тот же клиент) — 429.
+	resp2, err := http.Get(h.ts.URL + "/polls/p1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("second GET status = %d, want 429", resp2.StatusCode)
+	}
+}
+
+func TestGetPoll_ExistingCookieBypassesLimit(t *testing.T) {
+	h := newHarness(t, Config{})
+	h.addPoll("p1", h.clock.now().Add(time.Minute))
+
+	// Клиент с уже выданной cookie: сколько раз ни открывай страницу —
+	// новых cookie не выдаётся, лимит не срабатывает.
+	cookie := h.signedCookie("p1", "raw-1")
+	for i := 0; i < 3; i++ {
+		req, _ := http.NewRequest(http.MethodGet, h.ts.URL+"/polls/p1", nil)
+		req.AddCookie(cookie)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET #%d status = %d, want 200", i+1, resp.StatusCode)
+		}
+		if cs := resp.Cookies(); len(cs) != 0 {
+			t.Fatalf("GET #%d must not reissue cookie, got %+v", i+1, cs)
+		}
+	}
+}
+
+func TestGetPoll_IssueLimitExpiresAfterPoll(t *testing.T) {
+	h := newHarness(t, Config{})
+	endsAt := h.clock.now().Add(30 * time.Second)
+	h.addPoll("p1", endsAt)
+
+	resp1, _ := http.Get(h.ts.URL + "/polls/p1")
+	resp1.Body.Close()
+	if resp1.StatusCode != http.StatusOK {
+		t.Fatalf("first GET = %d, want 200", resp1.StatusCode)
+	}
+
+	// Пока опрос идёт — повторная выдача запрещена.
+	resp2, _ := http.Get(h.ts.URL + "/polls/p1")
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("second GET = %d, want 429", resp2.StatusCode)
+	}
+
+	// После ends_at + issueTTLGrace запись лимитера истекает.
+	h.clock.set(endsAt.Add(issueTTLGrace + time.Second))
+	resp3, _ := http.Get(h.ts.URL + "/polls/p1")
+	resp3.Body.Close()
+	if resp3.StatusCode != http.StatusOK {
+		t.Fatalf("GET after cooldown = %d, want 200", resp3.StatusCode)
+	}
+}
+
+func TestGetPoll_IssueLimitDisabled(t *testing.T) {
+	h := newHarness(t, Config{DisableIssueLimit: true})
+	h.addPoll("p1", h.clock.now().Add(time.Minute))
+
+	for i := 0; i < 3; i++ {
+		resp, _ := http.Get(h.ts.URL + "/polls/p1")
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET #%d = %d, want 200 (limit disabled)", i+1, resp.StatusCode)
+		}
+		if len(resp.Cookies()) != 1 {
+			t.Fatalf("GET #%d should issue a cookie when limit is disabled", i+1)
+		}
+	}
+}
+
+func TestIssueLimiter_AllowAndExpire(t *testing.T) {
+	clock := &testClock{t: time.Date(2026, 9, 10, 8, 0, 0, 0, time.UTC)}
+	l := newIssueLimiter(0, clock.now)
+
+	exp := clock.now().Add(time.Minute)
+	if !l.Allow("k1", exp) {
+		t.Fatal("first Allow must return true")
+	}
+	if l.Allow("k1", exp) {
+		t.Fatal("second Allow for same key must return false")
+	}
+	if !l.Allow("k2", exp) {
+		t.Fatal("different key must be allowed")
+	}
+
+	// После истечения — снова разрешено.
+	clock.set(exp.Add(time.Second))
+	if !l.Allow("k1", exp.Add(time.Minute)) {
+		t.Fatal("Allow after expiry must return true")
+	}
+}
+
+func TestIssueLimiter_Evicts(t *testing.T) {
+	clock := &testClock{t: time.Date(2026, 9, 10, 8, 0, 0, 0, time.UTC)}
+	l := newIssueLimiter(100, clock.now)
+	exp := clock.now().Add(time.Hour)
+
+	for i := 0; i < 500; i++ {
+		l.Allow(issueKey("k"+string(rune(i))), exp)
+	}
+	if got := l.size(); got > 100 {
+		t.Errorf("limiter size = %d, want <= 100 (eviction)", got)
 	}
 }

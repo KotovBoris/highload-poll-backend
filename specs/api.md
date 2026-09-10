@@ -17,27 +17,61 @@ API-воркер — stateless hot-path сервис: принимает гол�
 - HTTP/1.1, `net/http`, JSON.
 - Порт по умолчанию: **8080** (`HTTP_ADDR`, например `:8080`).
 
-## Модель fingerprint
+## Модель fingerprint и защита от накрутки
 
 ```
-fingerprint = cookie "voter_id"              если cookie есть (UUID, как есть)
-fingerprint = sha256(IP + "|" + User-Agent)  иначе
+fingerprint = raw UUID из ПОДПИСАННОЙ cookie   если подпись валидна для poll_id
+fingerprint = sha256(IP + "|" + User-Agent)    иначе (fallback)
 ```
 
 IP берётся из `X-Forwarded-For` → `X-Real-IP` → `RemoteAddr`.
 Реализация: [`internal/fingerprint`](../internal/fingerprint/fingerprint.go:1).
 
+### Подпись cookie (HMAC)
+
+Cookie выдаётся в формате `"<raw-uuid>.<hex HMAC-SHA256(secret, poll_id ‖ 0x00 ‖ raw)>"`.
+
+- Подпись привязана к **конкретному опросу**: cookie, выданная для одного опроса,
+  на другом не проходит проверку и уходит в fallback.
+- Подделать подпись без секрета нельзя (сравнение в постоянном времени).
+- Проверка — O(1), без обращений к хранилищу: cookie остаётся stateless.
+- Секрет — `COOKIE_SECRET`. Пустой → случайный (куки не выживают рестарт; только dev).
+
+### Лимит выдачи cookie (анти-накрутка)
+
+Подпись закрывает **подделку** идентификатора, но не мешает набрать настоящих
+подписанных cookie пачкой. Поэтому выдача ограничена: на пару
+**(poll_id, IP+UA) cookie выдаётся один раз**.
+
+- Реализация — in-memory LRU+TTL ([`internal/api/issued.go`](../internal/api/issued.go:1)),
+  записи живут до `ends_at` опроса + запас, объём ограничен `MAX_ISSUED_ENTRIES`.
+- Повторный `GET /polls/{id}` без cookie с той же пары → `429`.
+- Если cookie уже есть у клиента — новых не выдаётся (лимит не расходуется).
+
+**Осознанные ограничения:**
+
+- Лимит **локальный для процесса**: при N API-воркерах за round-robin фактический
+  лимит = N cookie на пару. В проде это снимается маршрутизацией на балансировщике
+  по ключу (consistent hashing по `poll_id|IP|UA`) — тогда все запросы пары идут
+  на один воркер и лимит точен. См. [`docs/architecture/04-architecture.md`](../docs/architecture/04-architecture.md).
+- Ротация IP/UA обходит лимит — от этого защищает только edge-слой (WAF/anti-bot),
+  вне рамок ТЗ.
+- `DISABLE_ISSUE_LIMIT=true` выключает лимит (используется нагрузочным тестом).
+
 ## Публичные ручки
 
 ### `GET /polls/{id}` — страница опроса
 
-Назначение: отдать метаданные опроса и **выдать cookie** `voter_id`.
+Назначение: отдать метаданные опроса и **выдать подписанную cookie** `voter_id`.
 
 - Сервер берёт метаданные из сервиса результатов
   (`GET /internal/polls/{id}`), кэширует.
-- Если в запросе нет cookie `voter_id` — генерирует UUIDv4 и ставит
-  `Set-Cookie: voter_id=<uuid>; Path=/; Max-Age=86400; SameSite=Lax; HttpOnly`.
+- Если в запросе нет cookie `voter_id` — генерирует UUIDv4, подписывает его для
+  этого `poll_id` и ставит
+  `Set-Cookie: voter_id=<uuid>.<hmac>; Path=/; Max-Age=86400; SameSite=Lax; HttpOnly`.
   Если cookie уже есть — повторно не выдаёт (не перезаписывает).
+- Выдача ограничена: на пару (poll_id, IP+UA) — один раз, иначе `429`
+  (см. раздел о лимите выше).
 - В ответе **нет** результатов опроса (результаты не публичные).
 
 Ответ: `200 OK`, [`model.Poll`](../internal/model/model.go:1) (без `results`).
@@ -83,6 +117,7 @@ IP берётся из `X-Forwarded-For` → `X-Real-IP` → `RemoteAddr`.
 | `400` | Невалидный JSON / `option_id` отсутствует или не входит в опции |
 | `403` | Опрос закрыт (`now >= ends_at`) — `poll_closed` |
 | `404` | Опрос не найден |
+| `429` | Cookie уже выдавалась для этой пары (poll_id, IP+UA) — только на `GET /polls/{id}` |
 | `503` | Не удалось получить метаданные опроса (сервис результатов недоступен, кэша нет) |
 
 ### `GET /healthz`
@@ -140,6 +175,9 @@ IP берётся из `X-Forwarded-For` → `X-Real-IP` → `RemoteAddr`.
 | `VOTE_BATCH_SIZE` | `10000` | Порог срабатывания батча |
 | `POLL_CACHE_TTL` | `1m` | TTL кэша метаданных опроса |
 | `CLOSE_CHECK_INTERVAL` | `500ms` | Период фоновой проверки `ends_at` |
+| `COOKIE_SECRET` | — (пусто → случайный) | Секрет HMAC-подписи cookie |
+| `MAX_ISSUED_ENTRIES` | `1000000` | Предел записей лимитера выдачи (0 — без предела) |
+| `DISABLE_ISSUE_LIMIT` | `false` | Выключить лимит выдачи (нагрузочный тест) |
 | `PRODUCE_QUEUE_SIZE` | `4096` | Размер очереди на отправку |
 | `PRODUCE_WORKERS` | `4` | Число фоновых продюсеров |
 | `SHUTDOWN_TIMEOUT` | `10s` | Таймаут graceful shutdown (флаш остатков) |
