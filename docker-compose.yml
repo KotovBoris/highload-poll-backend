@@ -152,6 +152,9 @@ services:
       KAFKA_GROUP_ID: "poll-consumers"
       RESULTS_URL: "http://results:8081"
       HTTP_ADDR: ":8082"
+      # Пауза после ends_at: даём хвостовым голосам и "done" догнать consumer.
+      # В локальном docker хватает ~1s (проверено), но держим 5s с запасом на
+      # реальные сетевые задержки. Балансируется через эту переменную.
       CLOSE_GRACE: "5s"
       CLOSE_HARD_TIMEOUT: "1m"
       COMMIT_DONE_PERCENT: "90"
