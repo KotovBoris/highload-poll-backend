@@ -44,6 +44,7 @@ func run(logger *slog.Logger) error {
 	shutdownTimeout := config.Duration("SHUTDOWN_TIMEOUT", 10*time.Second)
 	cookieSecret := config.String("COOKIE_SECRET", "")
 	maxIssued := config.Int("MAX_ISSUED_ENTRIES", 1000000)
+	maxCookiesPerClient := config.Int("MAX_COOKIES_PER_CLIENT", 1000)
 	disableIssueLimit := config.Bool("DISABLE_ISSUE_LIMIT", false)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -67,13 +68,14 @@ func run(logger *slog.Logger) error {
 
 	client := resultsclient.NewHTTPClient(resultsURL, 5*time.Second)
 	server := api.NewServer(client, sender, api.Config{
-		WorkerID:          workerID,
-		BatchSize:         batchSize,
-		CacheTTL:          cacheTTL,
-		CloseTTL:          cacheTTL,
-		CookieSecret:      cookieSecret,
-		MaxIssuedEntries:  maxIssued,
-		DisableIssueLimit: disableIssueLimit,
+		WorkerID:            workerID,
+		BatchSize:           batchSize,
+		CacheTTL:            cacheTTL,
+		CloseTTL:            cacheTTL,
+		CookieSecret:        cookieSecret,
+		MaxIssuedEntries:    maxIssued,
+		MaxCookiesPerClient: maxCookiesPerClient,
+		DisableIssueLimit:   disableIssueLimit,
 	}, logger)
 
 	go server.StartWatcher(ctx, closeCheck)

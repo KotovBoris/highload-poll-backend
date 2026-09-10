@@ -88,7 +88,7 @@ func TestFromRequest_NoCookieFallsBack(t *testing.T) {
 	req.Header.Set("X-Forwarded-For", "1.2.3.4")
 	req.Header.Set("User-Agent", "agent")
 
-	want := HashIPUA("1.2.3.4", "agent")
+	want := HashIP("1.2.3.4")
 	if got := FromRequest(req, "p1", s); got != want {
 		t.Errorf("fingerprint = %q, want fallback %q", got, want)
 	}
@@ -102,9 +102,30 @@ func TestFromRequest_InvalidCookieFallsBack(t *testing.T) {
 	req.Header.Set("User-Agent", "agent")
 	req.RemoteAddr = "1.2.3.4:5678"
 
-	want := HashIPUA("1.2.3.4", "agent")
+	want := HashIP("1.2.3.4")
 	if got := FromRequest(req, "p1", s); got != want {
 		t.Errorf("fingerprint = %q, want fallback %q", got, want)
+	}
+}
+
+// Ключевое свойство анти-накрутки: ротация User-Agent не даёт новых
+// fingerprint'ов — fallback зависит только от IP.
+func TestFromRequest_UARotationDoesNotChangeFallback(t *testing.T) {
+	s := NewSigner("secret")
+
+	fp := func(ua string) string {
+		req := httptest.NewRequest(http.MethodPost, "/polls/p1/vote", nil)
+		req.Header.Set("X-Forwarded-For", "5.6.7.8")
+		req.Header.Set("User-Agent", ua)
+		return FromRequest(req, "p1", s)
+	}
+
+	first := fp("bot-1")
+	if got := fp("bot-2"); got != first {
+		t.Errorf("UA rotation changed fingerprint: %q -> %q (must be IP-only)", first, got)
+	}
+	if got := fp(""); got != first {
+		t.Errorf("empty UA changed fingerprint: %q -> %q", first, got)
 	}
 }
 

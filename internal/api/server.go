@@ -37,6 +37,8 @@ type Server struct {
 	closeTTL time.Duration
 	// limitIssuing выключает лимит выдачи (для нагрузочных тестов).
 	limitIssuing bool
+	// maxCookiesPerClient — предел выдач cookie на один IP в рамках опроса.
+	maxCookiesPerClient int
 }
 
 // Config — параметры сервера.
@@ -50,6 +52,9 @@ type Config struct {
 	CookieSecret string
 	// MaxIssuedEntries — предел числа записей лимитера выдачи. 0 — без предела.
 	MaxIssuedEntries int
+	// MaxCookiesPerClient — сколько cookie можно выдать одному IP в рамках
+	// опроса. 0 — без ограничения.
+	MaxCookiesPerClient int
 	// DisableIssueLimit отключает лимит выдачи (используется нагрузочным тестом).
 	DisableIssueLimit bool
 }
@@ -77,16 +82,17 @@ func NewServer(client resultsclient.Client, sender *Sender, cfg Config, logger *
 	}
 	now := time.Now
 	return &Server{
-		cache:        newPollCache(client, cfg.CacheTTL, now),
-		buf:          newVoteBuffer(cfg.BatchSize),
-		sender:       sender,
-		signer:       signer,
-		limiter:      newIssueLimiter(cfg.MaxIssuedEntries, now),
-		workerID:     cfg.WorkerID,
-		logger:       logger,
-		now:          now,
-		closeTTL:     cfg.CloseTTL,
-		limitIssuing: !cfg.DisableIssueLimit,
+		cache:               newPollCache(client, cfg.CacheTTL, now),
+		buf:                 newVoteBuffer(cfg.BatchSize),
+		sender:              sender,
+		signer:              signer,
+		limiter:             newIssueLimiter(cfg.MaxIssuedEntries, now),
+		maxCookiesPerClient: cfg.MaxCookiesPerClient,
+		workerID:            cfg.WorkerID,
+		logger:              logger,
+		now:                 now,
+		closeTTL:            cfg.CloseTTL,
+		limitIssuing:        !cfg.DisableIssueLimit,
 	}
 }
 
@@ -108,9 +114,10 @@ func (s *Server) Handler() http.Handler {
 
 // handleGetPoll — GET /polls/{id}: метаданные опроса + подписанная cookie.
 //
-// Cookie выдаётся только если её ещё нет и если для пары (poll_id, IP+UA)
-// cookie ранее не выдавалась. Повторная выдача для той же пары — 429: это
-// отсекает массовый «фарм» валидных cookie через многократные GET.
+// Ручка НИКОГДА не отвечает ошибкой из-за лимита: зритель обязан увидеть
+// страницу опроса. Если у клиента уже есть cookie или исчерпан лимит выдач
+// для его IP — страница отдаётся без новой cookie, и его голос уйдёт в
+// fallback-дедупликацию.
 func (s *Server) handleGetPoll(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	poll, err := s.cache.get(r.Context(), id)
@@ -122,33 +129,31 @@ func (s *Server) handleGetPoll(w http.ResponseWriter, r *http.Request) {
 	// Если у клиента уже есть cookie — повторно не выдаём (страница
 	// перезагружается, но новых cookie не появляется).
 	if _, has := fingerprint.CookieValue(r); !has {
-		if s.limitIssuing && !s.allowIssue(id, r, poll) {
-			httpx.WriteError(w, http.StatusTooManyRequests, httpx.ErrTooMany,
-				"voter cookie already issued for this poll")
-			return
+		if !s.limitIssuing || s.allowIssue(id, r, poll) {
+			_, cookieValue := s.signer.Issue(id)
+			http.SetCookie(w, &http.Cookie{
+				Name:     fingerprint.CookieName,
+				Value:    cookieValue,
+				Path:     "/",
+				MaxAge:   int(cookieMaxAge.Seconds()),
+				SameSite: http.SameSiteLaxMode,
+				HttpOnly: true,
+			})
 		}
-		_, cookieValue := s.signer.Issue(id)
-		http.SetCookie(w, &http.Cookie{
-			Name:     fingerprint.CookieName,
-			Value:    cookieValue,
-			Path:     "/",
-			MaxAge:   int(cookieMaxAge.Seconds()),
-			SameSite: http.SameSiteLaxMode,
-			HttpOnly: true,
-		})
 	}
 
 	poll.Results = nil // результаты не публичны
 	httpx.WriteJSON(w, http.StatusOK, poll)
 }
 
-// allowIssue регистрирует выдачу cookie по ключу (poll_id, IP+UA).
-// Возвращает false, если cookie для этой пары уже выдавалась.
+// allowIssue регистрирует выдачу cookie по ключу (poll_id, IP).
+// Возвращает false, если для этого IP исчерпан лимит выдач по опросу.
+// UA в ключ не входит: его ротация бесплатна и обесценила бы лимит.
 func (s *Server) allowIssue(pollID string, r *http.Request, poll model.Poll) bool {
-	key := issueKey(pollID + "|" + fingerprint.ClientKey(fingerprint.ClientIP(r), r.UserAgent()))
+	key := issueKey(pollID + "|" + fingerprint.HashIP(fingerprint.ClientIP(r)))
 	// Помним запись до ends_at + запас: после закрытия опроса лимит не нужен.
 	expiresAt := poll.EndsAt.Add(issueTTLGrace)
-	return s.limiter.Allow(key, expiresAt)
+	return s.limiter.Allow(key, s.maxCookiesPerClient, expiresAt)
 }
 
 // handleVote — POST /polls/{id}/vote.

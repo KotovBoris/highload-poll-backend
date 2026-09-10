@@ -32,7 +32,8 @@ internal/consumer                     — дедуп, завершение, ко
 internal/results                      — storage-интерфейс, хендлеры, PostgreSQL
 internal/kafka                        — Producer/Reader интерфейсы + segmentio
 internal/resultsclient                — HTTP-клиент к internal API results
-internal/fingerprint                  — cookie + sha256(IP|UA)
+internal/api/issued.go                — лимит выдачи cookie (счётчик на IP)
+internal/fingerprint                  — cookie (HMAC) + sha256(IP)
 internal/model, config, httpx, uuid   — общие пакеты
 specs/                                — контракты (api, consumer, results)
 migrations/001_init.sql               — схема polls
@@ -53,13 +54,15 @@ plans/implementation-plan.md          — план реализации
 5. **Завершение опроса:** «done» от воркеров + пороги (кворум Y%, остывание X
    сообщений, жёсткий таймаут). API-воркер шлёт «done» после `ends_at`.
 6. **Fingerprint:** **подписанная** cookie `voter_id` (`<uuid>.<hmac>`, HMAC-SHA256,
-   привязана к `poll_id`) primary, `sha256(IP|UA)` fallback.
+   привязана к `poll_id`) primary, `sha256(IP)` fallback — без UA.
 7. **Пробел архитектуры закрыт:** results отдаёт `GET /internal/polls/{id}`
    (метаданные + `ends_at`) для API и consumer.
-8. **Анти-накрутка (уровень 1):** HMAC-подпись cookie + лимит выдачи — одна
-   cookie на пару (poll_id, IP+UA), повторный GET → `429`. Лимит in-memory,
-   локальный для процесса; prod-путь — consistent hashing на балансировщике
-   по `poll_id|IP|UA` (зафиксировано, не реализовано). DDoS-защита вне рамок.
+8. **Анти-накрутка (уровень 1):** HMAC-подпись cookie + fallback по IP +
+   лимит-СЧЁТЧИК выдачи (`MAX_COOKIES_PER_CLIENT`=1000) на `(poll_id, IP)`.
+   `GET /polls/{id}` никогда не отвечает ошибкой — при исчерпании отдаёт
+   страницу без cookie. Лимит in-memory, локальный для процесса; prod-путь —
+   consistent hashing по `poll_id|IP` на балансировщике (зафиксировано).
+   DDoS-защита вне рамок.
 
 ## Добавления к исходной архитектуре (нужно знать)
 

@@ -5,61 +5,86 @@ import (
 	"time"
 )
 
-// issueKey — ключ лимита: конкретный опрос + хеш пары (IP, User-Agent).
-// UA хешируем, чтобы ключ был фиксированной длины.
+// issueKey — ключ лимита: конкретный опрос + IP клиента.
+// User-Agent намеренно НЕ входит в ключ: это клиентский заголовок, его ротация
+// бесплатна, и включение UA в ключ защиты обесценило бы лимит.
 type issueKey string
 
-// issueLimiter — in-memory ограничитель выдачи cookie: для одной пары
-// (poll_id, IP+UA) cookie выдаётся только один раз.
+// issueLimiter — in-memory ограничитель ВЫДАЧИ cookie: для одного IP в рамках
+// опроса можно выдать не более maxCookies cookie.
 //
 // Зачем: HMAC-подпись закрывает ПОДДЕЛКУ идентификатора, но не мешает набрать
 // настоящих подписанных cookie пачкой, многократно дёргая GET /polls/{id}.
-// Лимитер делает выдачу одноразовой на пару (опрос, клиент).
+// Лимит делает выдачу ограниченной на IP.
+//
+// Почему счётчик, а не «одна на IP»: за одним IP (особенно CGNAT мобильных
+// операторов) легитимно находятся сотни устройств. Жёсткое «1 на IP» отсекало
+// бы их всех, поэтому разрешаем до maxCookies выдач — этого хватает реальному
+// NAT, но одиночный атакующий с одного IP упирается в тот же предел вместо
+// миллионов голосов.
 //
 // Ограничения (осознанные):
 //   - Лимит локальный для процесса. При N API-воркерах за round-robin
-//     фактический лимит = N cookie на пару (каждый воркер ведёт свой учёт).
-//     В проде это решается маршрутизацией на балансировщике по ключу
-//     (consistent hashing по poll_id|IP|UA) — см. docs/architecture.
-//   - Ротация IP/UA обходит лимит; от этого защищает только edge-слой.
-//   - Записи живут до ends_at опроса, поэтому память самоочищается по TTL
-//     и дополнительно ограничена maxEntries (FIFO-вытеснение).
+//     фактический лимит = N × maxCookies. В проде снимается маршрутизацией на
+//     балансировщике по ключу (consistent hashing по poll_id|IP) — тогда все
+//     запросы IP идут на один воркер и лимит точен. См. docs/architecture.
+//   - Ротация IP обходит лимит; от этого защищает только edge-слой.
+//   - Записи живут до ends_at опроса, поэтому память самоочищается по TTL и
+//     дополнительно ограничена maxEntries (FIFO-вытеснение).
 type issueLimiter struct {
 	mu      sync.Mutex
-	entries map[issueKey]time.Time // ключ → момент истечения записи
-	order   []issueKey             // порядок вставки для FIFO-вытеснения
+	entries map[issueKey]*issueEntry
+	order   []issueKey // порядок вставки для FIFO-вытеснения
 	max     int
 	now     func() time.Time
 }
 
+type issueEntry struct {
+	count     int
+	expiresAt time.Time
+}
+
 // newIssueLimiter создаёт лимитер. max <= 0 означает «без ограничения объёма»
-// (записи всё равно удаляются по истечении).
+// записей (они всё равно удаляются по истечении).
 func newIssueLimiter(max int, now func() time.Time) *issueLimiter {
 	if now == nil {
 		now = time.Now
 	}
 	return &issueLimiter{
-		entries: make(map[issueKey]time.Time),
+		entries: make(map[issueKey]*issueEntry),
 		max:     max,
 		now:     now,
 	}
 }
 
-// Allow возвращает true и регистрирует выдачу, если для ключа ещё не выдавали
-// cookie (или прежняя запись истекла). expiresAt — до какого момента помнить
-// запись (обычно ends_at опроса + запас).
-func (l *issueLimiter) Allow(key issueKey, expiresAt time.Time) bool {
+// Allow пытается зарегистрировать выдачу cookie для ключа.
+// Возвращает true, если выдача разрешена (и учитывает её), и false, если
+// исчерпан лимит limit выдач для этого ключа.
+// expiresAt — до какого момента (обычно ends_at опроса + запас) помнить запись.
+func (l *issueLimiter) Allow(key issueKey, limit int, expiresAt time.Time) bool {
+	if limit <= 0 {
+		return true // лимит отключён
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
 	now := l.now()
-	if exp, ok := l.entries[key]; ok && now.Before(exp) {
-		return false // уже выдавали — повторная выдача запрещена
+	e, ok := l.entries[key]
+	if !ok || now.After(e.expiresAt) {
+		// Новая или истёкшая запись — начинаем счёт заново.
+		l.entries[key] = &issueEntry{count: 1, expiresAt: expiresAt}
+		l.order = append(l.order, key)
+		l.evictLocked()
+		return true
 	}
-
-	l.entries[key] = expiresAt
-	l.order = append(l.order, key)
-	l.evictLocked()
+	if e.count >= limit {
+		// Продлеваем срок жизни записи, чтобы серия запросов не «сбросила»
+		// счётчик по истечении посреди опроса.
+		e.expiresAt = expiresAt
+		return false
+	}
+	e.count++
+	e.expiresAt = expiresAt
 	return true
 }
 
@@ -68,11 +93,10 @@ func (l *issueLimiter) Allow(key issueKey, expiresAt time.Time) bool {
 func (l *issueLimiter) evictLocked() {
 	now := l.now()
 
-	// Сначала — истёкшие.
 	if len(l.order) > 64 {
 		kept := l.order[:0]
 		for _, k := range l.order {
-			if exp, ok := l.entries[k]; ok && now.Before(exp) {
+			if e, ok := l.entries[k]; ok && now.Before(e.expiresAt) {
 				kept = append(kept, k)
 				continue
 			}
@@ -81,7 +105,6 @@ func (l *issueLimiter) evictLocked() {
 		l.order = kept
 	}
 
-	// Затем — вытеснение по объёму.
 	if l.max > 0 {
 		for len(l.entries) > l.max && len(l.order) > 0 {
 			oldest := l.order[0]
@@ -96,4 +119,14 @@ func (l *issueLimiter) size() int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return len(l.entries)
+}
+
+// count возвращает число учтённых выдач для ключа (для тестов).
+func (l *issueLimiter) count(key issueKey) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if e, ok := l.entries[key]; ok {
+		return e.count
+	}
+	return 0
 }

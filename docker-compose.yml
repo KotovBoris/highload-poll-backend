@@ -92,7 +92,9 @@ services:
       # Секрет HMAC-подписи cookie. В проде задаётся из секрет-хранилища.
       COOKIE_SECRET: "dev-cookie-secret-change-me"
       MAX_ISSUED_ENTRIES: "1000000"
-      # Лимит выдачи cookie включён: одна cookie на пару (poll_id, IP+UA).
+      # Сколько cookie можно выдать одному IP в рамках опроса. Значение
+      # рассчитано на CGNAT мобильных операторов (сотни устройств за IP).
+      MAX_COOKIES_PER_CLIENT: "1000"
       DISABLE_ISSUE_LIMIT: "false"
     ports:
       - "8080:8080"

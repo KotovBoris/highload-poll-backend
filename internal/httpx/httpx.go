@@ -19,7 +19,6 @@ const (
 	ErrClosed      = "poll_closed"
 	ErrInternal    = "internal_error"
 	ErrUnavailable = "unavailable"
-	ErrTooMany     = "too_many_requests"
 )
 
 // maxBodyBytes ограничивает размер тела запроса (защита от злоупотребления).

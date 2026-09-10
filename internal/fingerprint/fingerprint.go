@@ -4,11 +4,18 @@
 // Стратегия (см. docs/architecture/03-deduplication.md):
 //
 //	fingerprint = raw UUID из ПОДПИСАННОЙ cookie   — если подпись валидна
-//	fingerprint = sha256(IP + "|" + User-Agent)    — иначе (fallback)
+//	fingerprint = sha256(IP)                       — иначе (fallback)
 //
 // Подпись проверяется относительно конкретного poll_id (см. signature.go),
 // поэтому cookie, выданная для одного опроса, не принимается на другом, а
 // выдуманный вручную UUID отбрасывается и уходит в fallback.
+//
+// Fallback намеренно строится ТОЛЬКО по IP, без User-Agent. UA — клиентский
+// заголовок, его ротация бесплатна, и он превращал fallback в «бесконечный
+// источник новых fingerprint'ов»: атакующий слал UA: bot-1, bot-2, ... и каждый
+// раз получал новый fingerprint. Без UA один IP без cookie даёт ровно один
+// fingerprint, поэтому накрутка с одного IP ограничена (ценой схлопывания
+// нескольких устройств за одним NAT без cookie — осознанный компромисс).
 package fingerprint
 
 import (
@@ -43,7 +50,7 @@ func FromRequest(r *http.Request, pollID string, v Verifier) string {
 			return raw
 		}
 	}
-	return HashIPUA(ClientIP(r), r.UserAgent())
+	return HashIP(ClientIP(r))
 }
 
 // CookieValue возвращает сырое значение cookie voter_id, если она есть.
@@ -56,15 +63,11 @@ func CookieValue(r *http.Request) (string, bool) {
 	return c.Value, true
 }
 
-// ClientKey строит ключ лимита выдачи: хеш пары (IP, User-Agent) в hex.
-func ClientKey(ip, userAgent string) string {
-	return HashIPUA(ip, userAgent)
-}
-
-// HashIPUA возвращает hex-представление sha256 от "IP|User-Agent".
+// HashIP возвращает hex-представление sha256 от IP.
 // Фиксированная длина (64 символа) делает ключ компактным и единообразным.
-func HashIPUA(ip, userAgent string) string {
-	sum := sha256.Sum256([]byte(ip + "|" + userAgent))
+// UA сознательно не участвует — см. комментарий к пакету.
+func HashIP(ip string) string {
+	sum := sha256.Sum256([]byte(ip))
 	return hex.EncodeToString(sum[:])
 }
 

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -506,7 +507,7 @@ func TestVote_TamperedCookieFallsBackToIPUA(t *testing.T) {
 	forged := &http.Cookie{Name: fingerprint.CookieName, Value: "attacker-uuid.deadbeefdeadbeef"}
 	got := voteFingerprint(t, h, "p1", forged, "10.0.0.1", "agent")
 
-	want := fingerprint.HashIPUA("10.0.0.1", "agent")
+	want := fingerprint.HashIP("10.0.0.1")
 	if got != want {
 		t.Errorf("fingerprint = %q, want fallback %q", got, want)
 	}
@@ -523,7 +524,7 @@ func TestVote_CookieFromOtherPollFallsBack(t *testing.T) {
 	// Cookie подписана для другого опроса — на p1 недействительна.
 	got := voteFingerprint(t, h, "p1", h.signedCookie("other", "raw-uuid-2"), "10.0.0.2", "agent")
 
-	want := fingerprint.HashIPUA("10.0.0.2", "agent")
+	want := fingerprint.HashIP("10.0.0.2")
 	if got != want {
 		t.Errorf("fingerprint = %q, want fallback %q (cookie bound to another poll)", got, want)
 	}
@@ -531,40 +532,92 @@ func TestVote_CookieFromOtherPollFallsBack(t *testing.T) {
 
 // ---- Лимит выдачи cookie ----
 
-func TestGetPoll_SecondIssueIsLimited(t *testing.T) {
-	h := newHarness(t, Config{})
+// getPollFrom делает GET /polls/{id} с заданным IP (X-Forwarded-For).
+func getPollFrom(t *testing.T, h *testHarness, pollID, ip string) *http.Response {
+	t.Helper()
+	req, _ := http.NewRequest(http.MethodGet, h.ts.URL+"/polls/"+pollID, nil)
+	if ip != "" {
+		req.Header.Set("X-Forwarded-For", ip)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	return resp
+}
+
+// Страница опроса отдаётся всегда, даже когда лимит исчерпан: зритель не
+// должен упираться в ошибку. Просто cookie не выдаётся.
+func TestGetPoll_NeverFailsOnIssueLimit(t *testing.T) {
+	h := newHarness(t, Config{MaxCookiesPerClient: 1})
 	h.addPoll("p1", h.clock.now().Add(time.Minute))
 
-	// Первый GET с данного IP+UA — 200 + cookie.
-	resp1, err := http.Get(h.ts.URL + "/polls/p1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp1.Body.Close()
-	if resp1.StatusCode != http.StatusOK {
-		t.Fatalf("first GET status = %d, want 200", resp1.StatusCode)
-	}
-	if len(resp1.Cookies()) != 1 {
-		t.Fatalf("first GET should issue a cookie")
+	resp1 := getPollFrom(t, h, "p1", "10.0.0.1")
+	if resp1.StatusCode != http.StatusOK || len(resp1.Cookies()) != 1 {
+		t.Fatalf("first GET: status=%d cookies=%d, want 200 + cookie",
+			resp1.StatusCode, len(resp1.Cookies()))
 	}
 
-	// Второй GET с того же IP+UA (тот же http.Get => тот же клиент) — 429.
-	resp2, err := http.Get(h.ts.URL + "/polls/p1")
-	if err != nil {
-		t.Fatal(err)
+	// Второй GET с того же IP: лимит исчерпан, но страница обязана отдаться.
+	resp2 := getPollFrom(t, h, "p1", "10.0.0.1")
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("second GET status = %d, want 200 (must never fail on limit)", resp2.StatusCode)
 	}
-	resp2.Body.Close()
-	if resp2.StatusCode != http.StatusTooManyRequests {
-		t.Fatalf("second GET status = %d, want 429", resp2.StatusCode)
+	if len(resp2.Cookies()) != 0 {
+		t.Errorf("second GET must not issue a cookie, got %+v", resp2.Cookies())
+	}
+}
+
+func TestGetPoll_IssueLimitPerIP(t *testing.T) {
+	h := newHarness(t, Config{MaxCookiesPerClient: 2})
+	h.addPoll("p1", h.clock.now().Add(time.Minute))
+
+	// Разные IP считаются независимо.
+	for i := 0; i < 2; i++ {
+		if cs := getPollFrom(t, h, "p1", "10.0.0.1").Cookies(); len(cs) != 1 {
+			t.Fatalf("IP1 GET #%d should issue a cookie", i+1)
+		}
+	}
+	if cs := getPollFrom(t, h, "p1", "10.0.0.1").Cookies(); len(cs) != 0 {
+		t.Error("IP1 exceeded its limit, must not issue")
+	}
+	if cs := getPollFrom(t, h, "p1", "10.0.0.2").Cookies(); len(cs) != 1 {
+		t.Error("IP2 must have its own limit")
+	}
+}
+
+// UA не участвует в ключе лимита: ротация UA не даёт дополнительных выдач.
+func TestGetPoll_IssueLimitIgnoresUA(t *testing.T) {
+	h := newHarness(t, Config{MaxCookiesPerClient: 1})
+	h.addPoll("p1", h.clock.now().Add(time.Minute))
+
+	getWithUA := func(ua string) *http.Response {
+		req, _ := http.NewRequest(http.MethodGet, h.ts.URL+"/polls/p1", nil)
+		req.Header.Set("X-Forwarded-For", "10.0.0.5")
+		req.Header.Set("User-Agent", ua)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp
+	}
+
+	if cs := getWithUA("ua-1").Cookies(); len(cs) != 1 {
+		t.Fatal("first GET should issue a cookie")
+	}
+	if cs := getWithUA("ua-2").Cookies(); len(cs) != 0 {
+		t.Error("changing UA must not yield another cookie (key is IP-only)")
 	}
 }
 
 func TestGetPoll_ExistingCookieBypassesLimit(t *testing.T) {
-	h := newHarness(t, Config{})
+	h := newHarness(t, Config{MaxCookiesPerClient: 1})
 	h.addPoll("p1", h.clock.now().Add(time.Minute))
 
 	// Клиент с уже выданной cookie: сколько раз ни открывай страницу —
-	// новых cookie не выдаётся, лимит не срабатывает.
+	// новых cookie не выдаётся и лимит не расходуется.
 	cookie := h.signedCookie("p1", "raw-1")
 	for i := 0; i < 3; i++ {
 		req, _ := http.NewRequest(http.MethodGet, h.ts.URL+"/polls/p1", nil)
@@ -584,29 +637,21 @@ func TestGetPoll_ExistingCookieBypassesLimit(t *testing.T) {
 }
 
 func TestGetPoll_IssueLimitExpiresAfterPoll(t *testing.T) {
-	h := newHarness(t, Config{})
+	h := newHarness(t, Config{MaxCookiesPerClient: 1})
 	endsAt := h.clock.now().Add(30 * time.Second)
 	h.addPoll("p1", endsAt)
 
-	resp1, _ := http.Get(h.ts.URL + "/polls/p1")
-	resp1.Body.Close()
-	if resp1.StatusCode != http.StatusOK {
-		t.Fatalf("first GET = %d, want 200", resp1.StatusCode)
+	if cs := getPollFrom(t, h, "p1", "10.0.0.7").Cookies(); len(cs) != 1 {
+		t.Fatal("first GET should issue a cookie")
 	}
-
-	// Пока опрос идёт — повторная выдача запрещена.
-	resp2, _ := http.Get(h.ts.URL + "/polls/p1")
-	resp2.Body.Close()
-	if resp2.StatusCode != http.StatusTooManyRequests {
-		t.Fatalf("second GET = %d, want 429", resp2.StatusCode)
+	if cs := getPollFrom(t, h, "p1", "10.0.0.7").Cookies(); len(cs) != 0 {
+		t.Fatal("second GET must not issue (limit reached)")
 	}
 
 	// После ends_at + issueTTLGrace запись лимитера истекает.
 	h.clock.set(endsAt.Add(issueTTLGrace + time.Second))
-	resp3, _ := http.Get(h.ts.URL + "/polls/p1")
-	resp3.Body.Close()
-	if resp3.StatusCode != http.StatusOK {
-		t.Fatalf("GET after cooldown = %d, want 200", resp3.StatusCode)
+	if cs := getPollFrom(t, h, "p1", "10.0.0.7").Cookies(); len(cs) != 1 {
+		t.Error("GET after cooldown should issue again")
 	}
 }
 
@@ -615,8 +660,7 @@ func TestGetPoll_IssueLimitDisabled(t *testing.T) {
 	h.addPoll("p1", h.clock.now().Add(time.Minute))
 
 	for i := 0; i < 3; i++ {
-		resp, _ := http.Get(h.ts.URL + "/polls/p1")
-		resp.Body.Close()
+		resp := getPollFrom(t, h, "p1", "10.0.0.9")
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("GET #%d = %d, want 200 (limit disabled)", i+1, resp.StatusCode)
 		}
@@ -626,25 +670,40 @@ func TestGetPoll_IssueLimitDisabled(t *testing.T) {
 	}
 }
 
-func TestIssueLimiter_AllowAndExpire(t *testing.T) {
+func TestIssueLimiter_CounterAndLimit(t *testing.T) {
 	clock := &testClock{t: time.Date(2026, 9, 10, 8, 0, 0, 0, time.UTC)}
 	l := newIssueLimiter(0, clock.now)
-
 	exp := clock.now().Add(time.Minute)
-	if !l.Allow("k1", exp) {
-		t.Fatal("first Allow must return true")
+
+	// Лимит 3: три выдачи разрешены, четвёртая — нет.
+	for i := 0; i < 3; i++ {
+		if !l.Allow("k1", 3, exp) {
+			t.Fatalf("allow #%d must be true", i+1)
+		}
 	}
-	if l.Allow("k1", exp) {
-		t.Fatal("second Allow for same key must return false")
+	if l.Allow("k1", 3, exp) {
+		t.Error("4th allow must be false (limit 3)")
 	}
-	if !l.Allow("k2", exp) {
-		t.Fatal("different key must be allowed")
+	if got := l.count("k1"); got != 3 {
+		t.Errorf("count = %d, want 3", got)
 	}
 
-	// После истечения — снова разрешено.
+	// Другой ключ — свой счётчик.
+	if !l.Allow("k2", 3, exp) {
+		t.Error("different key must be allowed")
+	}
+
+	// Лимит 0 — без ограничения.
+	for i := 0; i < 100; i++ {
+		if !l.Allow("k3", 0, exp) {
+			t.Fatal("limit 0 must always allow")
+		}
+	}
+
+	// После истечения счётчик сбрасывается.
 	clock.set(exp.Add(time.Second))
-	if !l.Allow("k1", exp.Add(time.Minute)) {
-		t.Fatal("Allow after expiry must return true")
+	if !l.Allow("k1", 3, exp.Add(time.Minute)) {
+		t.Error("allow after expiry must reset the counter")
 	}
 }
 
@@ -654,7 +713,7 @@ func TestIssueLimiter_Evicts(t *testing.T) {
 	exp := clock.now().Add(time.Hour)
 
 	for i := 0; i < 500; i++ {
-		l.Allow(issueKey("k"+string(rune(i))), exp)
+		l.Allow(issueKey("k"+strconv.Itoa(i)), 5, exp)
 	}
 	if got := l.size(); got > 100 {
 		t.Errorf("limiter size = %d, want <= 100 (eviction)", got)
