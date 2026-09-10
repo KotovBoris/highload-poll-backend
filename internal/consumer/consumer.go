@@ -87,9 +87,10 @@ func New(reader kafka.Reader, client resultsclient.Client, cfg Config, logger *s
 	// полный батч, и его голоса уйдут только вместе с его "done". Если grace=0,
 	// опрос завершится по "done" первого воркера (кворум 1 из 1), а голоса
 	// остальных будут потеряны. Проверено на сценарии с 2 воркерами: grace=0
-	// терял ~половину голосов. 5s хватает локально; в проде рекомендуется ~30s.
+	// терял ~половину голосов. 1s хватает локально; в проде рекомендуется ~30s
+	// (см. docs/architecture/04-architecture.md, §14).
 	if cfg.CloseGrace <= 0 {
-		cfg.CloseGrace = 5 * time.Second
+		cfg.CloseGrace = time.Second
 	}
 	if cfg.CloseHardTmo <= 0 {
 		cfg.CloseHardTmo = 5 * time.Minute

@@ -56,6 +56,9 @@ type config struct {
 	resultsTimeout time.Duration
 	tick           time.Duration
 	seed           int64
+	// burst — режим поиска пика: один опрос, все воркеры жмут максимально
+	// быстро, без профиля и пейсинга.
+	burst bool
 }
 
 func main() {
@@ -79,6 +82,7 @@ func main() {
 		"сколько ждать готовности результатов после конца опроса")
 	flag.DurationVar(&cfg.tick, "tick", 25*time.Millisecond, "шаг планировщика нагрузки")
 	flag.Int64Var(&cfg.seed, "seed", 0, "seed генератора (0 — случайный)")
+	flag.BoolVar(&cfg.burst, "burst", false, "режим поиска пика: один опрос, максимальная скорость без профиля")
 	flag.Parse()
 
 	cfg.apiURLs = splitURLs(apiURLs)
@@ -185,6 +189,9 @@ type harness struct {
 }
 
 func run(cfg config) error {
+	if cfg.burst {
+		return runBurst(cfg)
+	}
 	client := &http.Client{
 		Timeout: 15 * time.Second,
 		Transport: &http.Transport{
@@ -638,4 +645,222 @@ func percentileDur(v []time.Duration, p float64) time.Duration {
 		return 0
 	}
 	return v[int(p*float64(len(v)-1))].Round(time.Millisecond)
+}
+
+// ---------- режим поиска пика (burst) ----------
+
+// runBurst создаёт один опрос и непрерывно шлёт голоса всеми воркерами на
+// максимальной скорости — без профиля и пейсинга. Нужен, чтобы найти потолок
+// системы. Метрики считаются по скользящим секундам, чтобы видеть деградацию.
+func runBurst(cfg config) error {
+	client := &http.Client{
+		Timeout: 15 * time.Second,
+		Transport: &http.Transport{
+			MaxIdleConns:        cfg.concurrency * 2,
+			MaxIdleConnsPerHost: cfg.concurrency * 2,
+			MaxConnsPerHost:     cfg.concurrency * 2,
+			IdleConnTimeout:     30 * time.Second,
+		},
+	}
+
+	if err := probe(cfg.adminURL+"/healthz", client); err != nil {
+		return fmt.Errorf("results service unreachable: %w", err)
+	}
+	apiURLs := make([]string, 0, len(cfg.apiURLs))
+	for _, u := range cfg.apiURLs {
+		if err := probe(u+"/healthz", client); err != nil {
+			fmt.Printf("warning: api worker %s unreachable, skipped\n", u)
+			continue
+		}
+		apiURLs = append(apiURLs, u)
+	}
+	if len(apiURLs) == 0 {
+		return fmt.Errorf("no reachable api workers")
+	}
+
+	// Опрос длится ровно столько, сколько жать нагрузку.
+	dur := cfg.pollDuration
+	if cfg.duration > 0 && cfg.duration < dur {
+		dur = cfg.duration
+	}
+	pollID, endsAt, err := createPollFor(client, cfg.adminURL, cfg.optionCount, int(dur.Seconds())+5)
+	if err != nil {
+		return fmt.Errorf("create poll: %w", err)
+	}
+	signer := fingerprint.NewSigner(cfg.cookieSecret)
+	fmt.Printf("BURST: poll=%s workers=%d concurrency=%d ends_at=%s\n",
+		pollID, len(apiURLs), cfg.concurrency, endsAt.Format(time.RFC3339))
+
+	var (
+		accepted  atomic.Int64
+		errs      atomic.Int64
+		seq       atomic.Int64
+		rr        atomic.Uint64
+		perSec    atomic.Int64
+		stopAt    = time.Now().Add(dur)
+		mu        sync.Mutex
+		latencies []time.Duration
+	)
+	url := func() string { return apiURLs[int(rr.Add(1))%len(apiURLs)] + "/polls/" + pollID + "/vote" }
+
+	// Замер секундного темпа.
+	lastTotal := int64(0)
+	go func() {
+		t := time.NewTicker(time.Second)
+		defer t.Stop()
+		for range t.C {
+			cur := accepted.Load()
+			perSec.Store(cur - lastTotal)
+			lastTotal = cur
+			fmt.Printf("  [%3.0fs] rps=%d accepted=%d err=%d\n",
+				time.Until(stopAt).Seconds()*-1+time.Until(stopAt).Seconds(), perSec.Load(), cur, errs.Load())
+			if time.Now().After(stopAt) {
+				return
+			}
+		}
+	}()
+
+	var wg sync.WaitGroup
+	for w := 0; w < cfg.concurrency; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for time.Now().Before(stopAt) {
+				raw := "b" + itoa(seq.Add(1))
+				body := []byte(`{"option_id":1}`)
+				req, _ := http.NewRequest(http.MethodPost, url(), bytes.NewReader(body))
+				req.Header.Set("Content-Type", "application/json")
+				req.AddCookie(&http.Cookie{Name: fingerprint.CookieName, Value: signer.Sign(pollID, raw)})
+				start := time.Now()
+				resp, err := client.Do(req)
+				d := time.Since(start)
+				mu.Lock()
+				latencies = append(latencies, d)
+				mu.Unlock()
+				if err != nil {
+					errs.Add(1)
+					continue
+				}
+				_, _ = io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+				if resp.StatusCode == http.StatusAccepted {
+					accepted.Add(1)
+				} else {
+					errs.Add(1)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	total := accepted.Load()
+	elapsed := dur.Seconds()
+	mu.Lock()
+	sorted := append([]time.Duration(nil), latencies...)
+	mu.Unlock()
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	pct := func(p float64) time.Duration {
+		if len(sorted) == 0 {
+			return 0
+		}
+		return sorted[int(p*float64(len(sorted)-1))].Round(time.Microsecond)
+	}
+
+	fmt.Printf("\n===== BURST РЕЗУЛЬТАТ =====\n")
+	fmt.Printf("  воркеров-клиентов:   %d\n", cfg.concurrency)
+	fmt.Printf("  длительность:        %s\n", dur)
+	fmt.Printf("  принято (202):       %d\n", total)
+	fmt.Printf("  ошибок:              %d\n", errs.Load())
+	fmt.Printf("  средний RPS:         %.0f\n", float64(total)/elapsed)
+	fmt.Printf("  последняя секунда:   %d rps\n", perSec.Load())
+	fmt.Printf("  latency p50/p90/p99: %s / %s / %s\n", pct(0.50), pct(0.90), pct(0.99))
+
+	// Проверяем, что голоса доехали.
+	fmt.Println("\n  жду результатов...")
+	deadline := time.Now().Add(cfg.resultsTimeout)
+	for {
+		got, status, err := fetchResultsFor(client, cfg.adminURL, pollID)
+		if err == nil && status == "completed" {
+			fmt.Printf("  учтено в результатах: %d (из %d принятых)\n", got, total)
+			if got < total {
+				return fmt.Errorf("LOST %d votes", total-got)
+			}
+			return nil
+		}
+		if time.Now().After(deadline) {
+			last := status
+			if err != nil {
+				last = err.Error()
+			}
+			return fmt.Errorf("results not ready: %s", last)
+		}
+		time.Sleep(time.Second)
+	}
+}
+
+func itoa(n int64) string {
+	if n == 0 {
+		return "0"
+	}
+	var b [20]byte
+	i := len(b)
+	for n > 0 {
+		i--
+		b[i] = byte('0' + n%10)
+		n /= 10
+	}
+	return string(b[i:])
+}
+
+func createPollFor(c *http.Client, adminURL string, options, durationSec int) (string, time.Time, error) {
+	opts := make([]string, options)
+	for i := range opts {
+		opts[i] = fmt.Sprintf("Option %d", i+1)
+	}
+	body, _ := json.Marshal(map[string]any{
+		"question":         "Burst test?",
+		"options":          opts,
+		"duration_seconds": durationSec,
+	})
+	resp, err := c.Post(adminURL+"/admin/polls", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return "", time.Time{}, fmt.Errorf("status %d: %s", resp.StatusCode, b)
+	}
+	var p struct {
+		ID     string    `json:"id"`
+		EndsAt time.Time `json:"ends_at"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&p); err != nil {
+		return "", time.Time{}, err
+	}
+	return p.ID, p.EndsAt, nil
+}
+
+func fetchResultsFor(c *http.Client, adminURL, pollID string) (int64, string, error) {
+	resp, err := c.Get(adminURL + "/admin/polls/" + pollID + "/results")
+	if err != nil {
+		return 0, "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return 0, "", fmt.Errorf("status %d", resp.StatusCode)
+	}
+	var payload struct {
+		Status  string `json:"status"`
+		Results *struct {
+			Total int64 `json:"total"`
+		} `json:"results"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return 0, "", err
+	}
+	if payload.Results != nil {
+		return payload.Results.Total, payload.Status, nil
+	}
+	return 0, payload.Status, nil
 }

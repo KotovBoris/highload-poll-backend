@@ -64,3 +64,7 @@ loadtest: ## Сценарный нагрузочный тест: 3 мин, 15 о
 .PHONY: loadtest-smoke
 loadtest-smoke: ## Быстрый smoke нагрузочного теста (~30 сек)
 	$(GO) run ./loadtest -duration 25s -polls 3 -poll-duration 10s -votes-per-poll 3000 -c 200
+
+.PHONY: loadtest-peak
+loadtest-peak: ## Поиск пика (burst): один опрос, максимальная скорость
+	$(GO) run ./loadtest -burst -poll-duration 10s -c 600
