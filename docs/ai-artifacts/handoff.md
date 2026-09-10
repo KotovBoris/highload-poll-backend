@@ -21,7 +21,8 @@ e2e и нагрузочный прогон выполнены.
 
 - Все интеграционные тесты проходят: `go test -race ./...`
 - E2E в Docker: `KEEP=1 ./scripts/e2e.sh` — пройден
-- Нагрузочный тест: `go run ./loadtest` — ~12–16K RPS, 0 ошибок, p99 40–66 ms
+- Нагрузочный тест: `make loadtest` (сценарный, 3 мин / 15 опросов по 30 с) —
+  599 973 голоса принято = 599 973 учтено, 15/15 OK, workers 2/2
 
 ## Что где лежит
 
@@ -37,7 +38,7 @@ internal/fingerprint                  — cookie (HMAC) + sha256(IP)
 internal/model, config, httpx, uuid   — общие пакеты
 specs/                                — контракты (api, consumer, results)
 migrations/001_init.sql               — схема polls
-loadtest/                             — нагрузочный тест (Go)
+loadtest/                             — сценарный нагрузочный тест (Go)
 scripts/e2e.sh                        — e2e-проверка
 plans/implementation-plan.md          — план реализации
 ```

@@ -1,18 +1,30 @@
-// Command loadtest — нагрузочный тест против поднятого стека (docker-compose).
+// Command loadtest — сценарный нагрузочный тест против docker-compose стека.
 //
-// Сценарий:
-//  1. Создать опрос через админку (results) с заданной длительностью.
-//  2. Прогреть GET /polls/{id} (получить cookie).
-//  3. Нагрузить POST /polls/{id}/vote с заданным числом воркеров и/или
-//     целевым RPS в течение окна голосования.
-//  4. Дождаться завершения опроса (ends_at + grace), опросить результаты.
+// Сценарий (значения по умолчанию):
+//   - общая длительность сценария — 3 минуты;
+//   - 15 опросов, каждый длится 30 секунд;
+//   - каждый опрос стартует в случайный момент внутри окна так, чтобы успеть
+//     завершиться до конца сценария (агрегированная нагрузка: разгон →
+//     плато → затухание);
+//   - внутри каждого опроса интенсивность растёт от нуля, достигает пика и
+//     затухает к нулю (параболический профиль);
+//   - cookie подписываются КЛИЕНТОМ известным секретом (тот же
+//     internal/fingerprint), поэтому каждый запрос идёт с уникальным
+//     fingerprint'ом и дедупликация на стороне consumer'а не срабатывает;
+//   - для каждого опроса измеряется время от ends_at до готовности результатов
+//     и сверяется число голосов: ни один принятый (202) голос не должен
+//     потеряться.
 //
-// Метрики: RPS (факт), latency p50/p90/p99/max, коды ответов, число голосов.
+// Проверка корректности:
+//
+//	accepted(202) == results.total  для каждого опроса
+//
+// Если расхождение или результаты не готовы за отведённое время — тест
+// завершается с ненулевым кодом.
 package main
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -20,54 +32,161 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
-	"os/signal"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
+
+	"github.com/KotovBoris/highload-poll-backend/internal/fingerprint"
 )
 
+// ---------- конфигурация ----------
+
 type config struct {
-	baseURL     string
-	adminURL    string
-	concurrency int
-	duration    time.Duration
-	targetRPS   int // 0 = без ограничения (максимальный темп)
-	optionCount int
-	uniqueIPs   int // диапазон фейковых X-Forwarded-For
-	waitResults bool
-	graceWait   time.Duration
-	// closeDelay — насколько позже окончания нагрузки закрывается опрос.
-	closeDelay time.Duration
+	apiURLs        []string
+	adminURL       string
+	duration       time.Duration
+	polls          int
+	pollDuration   time.Duration
+	votesPerPoll   int
+	optionCount    int
+	concurrency    int
+	cookieSecret   string
+	resultsTimeout time.Duration
+	tick           time.Duration
+	seed           int64
 }
 
 func main() {
+	var (
+		apiURLs  string
+		adminURL string
+	)
 	cfg := config{}
-	flag.StringVar(&cfg.baseURL, "base-url", "http://localhost:8080", "base URL API-воркера")
-	flag.StringVar(&cfg.adminURL, "admin-url", "http://localhost:8081", "base URL сервиса результатов")
-	flag.IntVar(&cfg.concurrency, "c", 200, "число параллельных воркеров")
-	flag.DurationVar(&cfg.duration, "d", 10*time.Second, "длительность нагрузки")
-	flag.IntVar(&cfg.targetRPS, "rps", 0, "целевой RPS (0 = без ограничения)")
-	flag.IntVar(&cfg.optionCount, "options", 4, "число вариантов ответа в опросе")
-	flag.IntVar(&cfg.uniqueIPs, "unique-ips", 100000, "диапазон уникальных X-Forwarded-For")
-	flag.BoolVar(&cfg.waitResults, "wait-results", true, "дождаться результатов после опроса")
-	flag.DurationVar(&cfg.graceWait, "grace", 60*time.Second, "доп. ожидание завершения опроса")
-	flag.DurationVar(&cfg.closeDelay, "close-delay", 3*time.Second, "через сколько после нагрузки закрывается опрос")
+	flag.StringVar(&apiURLs, "api-urls", "http://localhost:8080,http://localhost:8083",
+		"base URL API-воркеров через запятую (недоступные отбрасываются)")
+	flag.StringVar(&adminURL, "admin-url", "http://localhost:8081", "base URL сервиса результатов")
+	flag.DurationVar(&cfg.duration, "duration", 3*time.Minute, "длительность сценария")
+	flag.IntVar(&cfg.polls, "polls", 15, "число опросов")
+	flag.DurationVar(&cfg.pollDuration, "poll-duration", 30*time.Second, "длительность одного опроса")
+	flag.IntVar(&cfg.votesPerPoll, "votes-per-poll", 40000, "целевое число голосов на опрос")
+	flag.IntVar(&cfg.optionCount, "options", 4, "число вариантов ответа")
+	flag.IntVar(&cfg.concurrency, "c", 2000, "число параллельных воркеров-пользователей")
+	flag.StringVar(&cfg.cookieSecret, "cookie-secret", "dev-cookie-secret-change-me",
+		"секрет HMAC-подписи cookie (должен совпадать с COOKIE_SECRET API-воркеров)")
+	flag.DurationVar(&cfg.resultsTimeout, "results-timeout", 120*time.Second,
+		"сколько ждать готовности результатов после конца опроса")
+	flag.DurationVar(&cfg.tick, "tick", 25*time.Millisecond, "шаг планировщика нагрузки")
+	flag.Int64Var(&cfg.seed, "seed", 0, "seed генератора (0 — случайный)")
 	flag.Parse()
 
+	cfg.apiURLs = splitURLs(apiURLs)
+	cfg.adminURL = strings.TrimRight(adminURL, "/")
+
 	if err := run(cfg); err != nil {
-		fmt.Fprintln(os.Stderr, "loadtest failed:", err)
+		fmt.Fprintln(os.Stderr, "\nloadtest failed:", err)
 		os.Exit(1)
 	}
 }
 
-func run(cfg config) error {
-	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer cancel()
+func splitURLs(s string) []string {
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(strings.TrimRight(p, "/")); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
 
-	httpc := &http.Client{
-		Timeout: 5 * time.Second,
+// ---------- профиль нагрузки ----------
+
+// profileCumulative — доля голосов опроса, отправленных к моменту x ∈ [0,1].
+// Первообразная от веса 6x(1-x), нормированная на единицу: 3x² − 2x³.
+// Даёт плавный разгон, пик в середине и затухание.
+func profileCumulative(x float64) float64 {
+	switch {
+	case x <= 0:
+		return 0
+	case x >= 1:
+		return 1
+	default:
+		return 3*x*x - 2*x*x*x
+	}
+}
+
+// ---------- время исполнения ----------
+
+type pollPlan struct {
+	index   int
+	startAt time.Time
+}
+
+type pollRuntime struct {
+	index    int
+	id       string
+	beginsAt time.Time
+	endsAt   time.Time
+	target   int64
+	launched int64 // трогает только планировщик (один goroutine)
+
+	accepted  atomic.Int64
+	forbidden atomic.Int64
+
+	completedAt time.Time
+	resultTotal int64
+	resultsErr  error
+}
+
+type job struct {
+	poll *pollRuntime
+	seq  int64
+}
+
+type collector struct {
+	mu        sync.Mutex
+	latencies []time.Duration
+	accepted  atomic.Int64
+	forbidden atomic.Int64
+	badReq    atomic.Int64
+	errs      atomic.Int64
+}
+
+func (c *collector) record(d time.Duration) {
+	c.mu.Lock()
+	c.latencies = append(c.latencies, d)
+	c.mu.Unlock()
+}
+
+type harness struct {
+	cfg      config
+	client   *http.Client
+	signer   *fingerprint.Signer
+	apiURLs  []string
+	adminURL string
+
+	mu    sync.RWMutex
+	polls []*pollRuntime
+
+	seq  atomic.Int64
+	jobs chan job
+	rr   atomic.Uint64
+
+	col *collector
+	t0  time.Time
+
+	allCreated chan struct{}
+	stop       chan struct{}
+	workersWG  sync.WaitGroup
+	watchersWG sync.WaitGroup
+	runnersWG  sync.WaitGroup
+}
+
+func run(cfg config) error {
+	client := &http.Client{
+		Timeout: 15 * time.Second,
 		Transport: &http.Transport{
 			MaxIdleConns:        cfg.concurrency * 2,
 			MaxIdleConnsPerHost: cfg.concurrency * 2,
@@ -76,309 +195,447 @@ func run(cfg config) error {
 		},
 	}
 
-	// 1. Создаём опрос: заканчивается чуть позже окончания нагрузки, чтобы
-	// после прогона можно было дождаться закрытия и flush результатов.
-	pollDuration := int(cfg.duration.Seconds()) + int(cfg.closeDelay.Seconds())
-	pollID, endsAt, err := createPoll(httpc, cfg.adminURL, cfg.optionCount, pollDuration)
-	if err != nil {
-		return fmt.Errorf("create poll: %w", err)
+	// Проверяем, какие API-воркеры доступны.
+	if err := probe(cfg.adminURL+"/healthz", client); err != nil {
+		return fmt.Errorf("results service is not reachable at %s: %w", cfg.adminURL, err)
 	}
-	fmt.Printf("created poll id=%s ends_at=%s duration=%ds\n", pollID, endsAt.Format(time.RFC3339), pollDuration)
-
-	// 2. Прогрев: получаем cookie.
-	_, _, err = warmup(httpc, cfg.baseURL, pollID)
-	if err != nil {
-		return fmt.Errorf("warmup: %w", err)
+	apiURLs := make([]string, 0, len(cfg.apiURLs))
+	for _, u := range cfg.apiURLs {
+		if err := probe(u+"/healthz", client); err != nil {
+			fmt.Printf("warning: api worker %s unreachable, skipped (%v)\n", u, err)
+			continue
+		}
+		apiURLs = append(apiURLs, u)
+	}
+	if len(apiURLs) == 0 {
+		return fmt.Errorf("no reachable api workers among %v", cfg.apiURLs)
 	}
 
-	// 3. Нагрузка.
-	stats := runLoad(ctx, httpc, cfg, pollID)
+	seed := cfg.seed
+	if seed == 0 {
+		seed = time.Now().UnixNano()
+	}
 
-	fmt.Println("\n===== НАГРУЗКА =====")
-	printStats(stats, cfg)
+	h := &harness{
+		cfg:        cfg,
+		client:     client,
+		signer:     fingerprint.NewSigner(cfg.cookieSecret),
+		apiURLs:    apiURLs,
+		adminURL:   cfg.adminURL,
+		jobs:       make(chan job, cfg.concurrency*4),
+		col:        &collector{latencies: make([]time.Duration, 0, cfg.polls*cfg.votesPerPoll)},
+		allCreated: make(chan struct{}),
+		stop:       make(chan struct{}),
+	}
+	h.t0 = time.Now()
 
-	// 4. Ждём результаты.
-	if cfg.waitResults {
-		fmt.Println("\n===== ОЖИДАНИЕ РЕЗУЛЬТАТОВ =====")
-		if err := waitForResults(ctx, httpc, cfg, pollID); err != nil {
-			fmt.Println("wait results:", err)
+	fmt.Printf("scenario: duration=%s polls=%d poll-duration=%s votes/poll=%d concurrency=%d seed=%d\n",
+		cfg.duration, cfg.polls, cfg.pollDuration, cfg.votesPerPoll, cfg.concurrency, seed)
+	fmt.Printf("api workers: %v\n\n", apiURLs)
+
+	plan := h.buildPlan(seed)
+
+	h.startWorkers()
+	go h.createAndWatch(plan)
+
+	// Прогресс каждые 10 секунд.
+	progressDone := make(chan struct{})
+	go func() {
+		defer close(progressDone)
+		t := time.NewTicker(10 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+				fmt.Printf("  [%4.0fs] accepted=%d forbidden=%d errors=%d\n",
+					time.Since(h.t0).Seconds(), h.col.accepted.Load(), h.col.forbidden.Load(), h.col.errs.Load())
+			case <-h.stop:
+				return
+			}
+		}
+	}()
+
+	// Ждём создания всех опросов и завершения последнего.
+	<-h.allCreated
+	h.mu.RLock()
+	var maxEnd time.Time
+	for _, p := range h.polls {
+		if p.endsAt.After(maxEnd) {
+			maxEnd = p.endsAt
 		}
 	}
-	return nil
+	h.mu.RUnlock()
+
+	if d := time.Until(maxEnd); d > 0 {
+		fmt.Printf("\nall polls created, waiting %s until last poll ends...\n", d.Round(time.Second))
+		time.Sleep(d + h.cfg.tick)
+	}
+
+	close(h.stop)
+	h.runnersWG.Wait()
+	close(h.jobs)
+	h.workersWG.Wait()
+	<-progressDone
+
+	// Дожидаемся результатов по всем опросам.
+	fmt.Println("\nwaiting for results of all polls (done from all api workers)...")
+	h.watchersWG.Wait()
+
+	return h.report()
 }
 
-func createPoll(c *http.Client, adminURL string, options, durationSec int) (string, time.Time, error) {
-	opts := make([]string, options)
+func (h *harness) buildPlan(seed int64) []pollPlan {
+	rng := rand.New(rand.NewSource(seed))
+	maxStart := h.cfg.duration - h.cfg.pollDuration
+	if maxStart < 0 {
+		maxStart = 0
+	}
+	plan := make([]pollPlan, 0, h.cfg.polls)
+	for i := 0; i < h.cfg.polls; i++ {
+		offset := time.Duration(rng.Int63n(int64(maxStart) + 1))
+		plan = append(plan, pollPlan{index: i, startAt: h.t0.Add(offset)})
+	}
+	sort.Slice(plan, func(i, j int) bool { return plan[i].startAt.Before(plan[j].startAt) })
+	return plan
+}
+
+// createAndWatch создаёт опросы по расписанию и сразу запускает наблюдение
+// за его результатами.
+func (h *harness) createAndWatch(plan []pollPlan) {
+	defer close(h.allCreated)
+	for _, p := range plan {
+		if d := time.Until(p.startAt); d > 0 {
+			time.Sleep(d)
+		}
+		if h.stopped() {
+			return
+		}
+		created, err := h.createPoll()
+		if err != nil {
+			fmt.Printf("poll #%d creation failed: %v\n", p.index, err)
+			continue
+		}
+		rt := &pollRuntime{
+			index:    p.index,
+			id:       created.ID,
+			endsAt:   created.EndsAt,
+			beginsAt: created.EndsAt.Add(-h.cfg.pollDuration),
+			target:   int64(h.cfg.votesPerPoll),
+		}
+		h.mu.Lock()
+		h.polls = append(h.polls, rt)
+		h.mu.Unlock()
+
+		fmt.Printf("  poll #%02d created id=%s start=+%4.0fs end=+%4.0fs\n",
+			rt.index, rt.id, rt.beginsAt.Sub(h.t0).Seconds(), rt.endsAt.Sub(h.t0).Seconds())
+
+		h.runnersWG.Add(1)
+		go h.pump(rt)
+
+		h.watchersWG.Add(1)
+		go h.watchResults(rt)
+	}
+}
+
+func (h *harness) stopped() bool {
+	select {
+	case <-h.stop:
+		return true
+	default:
+		return false
+	}
+}
+
+// pump — планировщик одного опроса: раз в tick выдаёт порцию голосов согласно
+// параболическому профилю. У каждого опроса свой pump, поэтому профили
+// накладываются и агрегированная нагрузка сначала растёт, затем падает.
+func (h *harness) pump(p *pollRuntime) {
+	defer h.runnersWG.Done()
+	ticker := time.NewTicker(h.cfg.tick)
+	defer ticker.Stop()
+
+	for {
+		var now time.Time
+		select {
+		case <-h.stop:
+			return
+		case now = <-ticker.C:
+		}
+
+		if now.Before(p.beginsAt) {
+			continue
+		}
+		if !now.Before(p.endsAt) {
+			return
+		}
+		span := p.endsAt.Sub(p.beginsAt).Seconds()
+		if span <= 0 {
+			return
+		}
+		x := now.Sub(p.beginsAt).Seconds() / span
+		want := int64(float64(p.target) * profileCumulative(x))
+		if want <= p.launched {
+			continue
+		}
+		delta := want - p.launched
+		p.launched = want
+		for i := int64(0); i < delta; i++ {
+			h.jobs <- job{poll: p, seq: h.seq.Add(1)}
+		}
+	}
+}
+
+func (h *harness) startWorkers() {
+	for i := 0; i < h.cfg.concurrency; i++ {
+		h.workersWG.Add(1)
+		go func() {
+			defer h.workersWG.Done()
+			for j := range h.jobs {
+				h.doVote(j)
+			}
+		}()
+	}
+}
+
+// doVote формирует подписанную cookie и отправляет один голос.
+func (h *harness) doVote(j job) {
+	raw := fmt.Sprintf("u%d", j.seq)
+	cookieVal := h.signer.Sign(j.poll.id, raw)
+
+	body := []byte(fmt.Sprintf(`{"option_id":%d}`, int(j.seq)%h.cfg.optionCount+1))
+	url := h.apiURLs[int(h.rr.Add(1))%len(h.apiURLs)] + "/polls/" + j.poll.id + "/vote"
+
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		h.col.errs.Add(1)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: fingerprint.CookieName, Value: cookieVal})
+
+	start := time.Now()
+	resp, err := h.client.Do(req)
+	d := time.Since(start)
+	h.col.record(d)
+	if err != nil {
+		h.col.errs.Add(1)
+		return
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+
+	switch resp.StatusCode {
+	case http.StatusAccepted:
+		h.col.accepted.Add(1)
+		j.poll.accepted.Add(1)
+	case http.StatusForbidden:
+		// Опрос закрылся, пока запрос летел, — это нормально, голос не принят.
+		h.col.forbidden.Add(1)
+		j.poll.forbidden.Add(1)
+	case http.StatusBadRequest:
+		h.col.badReq.Add(1)
+	default:
+		h.col.errs.Add(1)
+	}
+}
+
+// watchResults ждёт, пока сервис результатов отдаст completed, и фиксирует
+// время готовности.
+func (h *harness) watchResults(rt *pollRuntime) {
+	defer h.watchersWG.Done()
+
+	deadline := time.Now().Add(h.cfg.resultsTimeout)
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		total, status, err := h.fetchResults(rt.id)
+		if err == nil && status == "completed" {
+			rt.completedAt = time.Now()
+			rt.resultTotal = total
+			return
+		}
+		if time.Now().After(deadline) {
+			if err != nil {
+				rt.resultsErr = fmt.Errorf("timeout, last error: %w", err)
+			} else {
+				rt.resultsErr = fmt.Errorf("timeout, last status: %s", status)
+			}
+			return
+		}
+		<-ticker.C
+	}
+}
+
+func (h *harness) fetchResults(pollID string) (total int64, status string, err error) {
+	resp, err := h.client.Get(h.adminURL + "/admin/polls/" + pollID + "/results")
+	if err != nil {
+		return 0, "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return 0, "", fmt.Errorf("status %d: %s", resp.StatusCode, b)
+	}
+	var payload struct {
+		Status  string `json:"status"`
+		Results *struct {
+			Total int64 `json:"total"`
+		} `json:"results"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return 0, "", err
+	}
+	if payload.Results != nil {
+		return payload.Results.Total, payload.Status, nil
+	}
+	return 0, payload.Status, nil
+}
+
+type createdPoll struct {
+	ID     string    `json:"id"`
+	EndsAt time.Time `json:"ends_at"`
+}
+
+func (h *harness) createPoll() (createdPoll, error) {
+	opts := make([]string, h.cfg.optionCount)
 	for i := range opts {
 		opts[i] = fmt.Sprintf("Option %d", i+1)
 	}
 	body, _ := json.Marshal(map[string]any{
 		"question":         "Load test question?",
 		"options":          opts,
-		"duration_seconds": durationSec,
+		"duration_seconds": int(h.cfg.pollDuration.Seconds()),
 	})
-	resp, err := c.Post(adminURL+"/admin/polls", "application/json", bytes.NewReader(body))
+	resp, err := h.client.Post(h.adminURL+"/admin/polls", "application/json", bytes.NewReader(body))
 	if err != nil {
-		return "", time.Time{}, err
+		return createdPoll{}, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusCreated {
-		b, _ := io.ReadAll(resp.Body)
-		return "", time.Time{}, fmt.Errorf("status %d: %s", resp.StatusCode, b)
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return createdPoll{}, fmt.Errorf("status %d: %s", resp.StatusCode, b)
 	}
-	var poll struct {
-		ID     string    `json:"id"`
-		EndsAt time.Time `json:"ends_at"`
+	var p createdPoll
+	if err := json.NewDecoder(resp.Body).Decode(&p); err != nil {
+		return createdPoll{}, err
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&poll); err != nil {
-		return "", time.Time{}, err
-	}
-	return poll.ID, poll.EndsAt, nil
+	return p, nil
 }
 
-func warmup(c *http.Client, baseURL, pollID string) (*http.Cookie, int, error) {
-	resp, err := c.Get(baseURL + "/polls/" + pollID)
+func probe(url string, c *http.Client) error {
+	resp, err := c.Get(url)
 	if err != nil {
-		return nil, 0, err
+		return err
 	}
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, resp.Body)
-	var cookie *http.Cookie
-	for _, ck := range resp.Cookies() {
-		if ck.Name == "voter_id" {
-			cookie = ck
-		}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("status %d", resp.StatusCode)
 	}
-	return cookie, resp.StatusCode, nil
+	return nil
 }
 
-type stats struct {
-	total    atomic.Int64
-	ok       atomic.Int64
-	accepted atomic.Int64
-	badReq   atomic.Int64
-	closed   atomic.Int64
-	errs     atomic.Int64
+// ---------- отчёт ----------
 
-	mu        sync.Mutex
-	latencies []time.Duration
-}
+func (h *harness) report() error {
+	h.mu.RLock()
+	polls := append([]*pollRuntime(nil), h.polls...)
+	h.mu.RUnlock()
+	sort.Slice(polls, func(i, j int) bool { return polls[i].index < polls[j].index })
 
-func (s *stats) record(d time.Duration, status int) {
-	s.total.Add(1)
-	switch status {
-	case http.StatusAccepted:
-		s.accepted.Add(1)
-		s.ok.Add(1)
-	case http.StatusForbidden:
-		s.closed.Add(1)
-	case http.StatusBadRequest:
-		s.badReq.Add(1)
-	case 0:
-		s.errs.Add(1)
-	default:
-		s.errs.Add(1)
-	}
-	s.mu.Lock()
-	s.latencies = append(s.latencies, d)
-	s.mu.Unlock()
-}
+	fmt.Println("\n===== РЕЗУЛЬТАТЫ ПО ОПРОСАМ =====")
+	fmt.Printf("%-4s %-10s %-10s %10s %10s %12s %10s\n",
+		"#", "start", "end", "accepted", "in-results", "ready-after", "verdict")
 
-func runLoad(ctx context.Context, c *http.Client, cfg config, pollID string) *stats {
-	st := &stats{latencies: make([]time.Duration, 0, 1<<20)}
+	var (
+		totalAccepted int64
+		totalResults  int64
+		readiness     []time.Duration
+		mismatches    int
+	)
 
-	voteURL := cfg.baseURL + "/polls/" + pollID + "/vote"
-	deadline := time.Now().Add(cfg.duration)
+	for _, p := range polls {
+		acc := p.accepted.Load()
+		totalAccepted += acc
+		verdict := "OK"
+		readyStr := "-"
 
-	// Ограничитель RPS (если задан).
-	var ticker *time.Ticker
-	var paceCh <-chan time.Time
-	if cfg.targetRPS > 0 {
-		interval := time.Second / time.Duration(cfg.targetRPS)
-		if interval <= 0 {
-			interval = time.Nanosecond
-		}
-		ticker = time.NewTicker(interval)
-		defer ticker.Stop()
-		paceCh = ticker.C
-	}
+		if p.resultsErr != nil {
+			verdict = "NO RESULT"
+			mismatches++
+		} else {
+			totalResults += p.resultTotal
+			readiness = append(readiness, p.completedAt.Sub(p.endsAt))
+			readyStr = p.completedAt.Sub(p.endsAt).Round(time.Millisecond).String()
 
-	var wg sync.WaitGroup
-	for i := 0; i < cfg.concurrency; i++ {
-		wg.Add(1)
-		go func(worker int) {
-			defer wg.Done()
-			rng := rand.New(rand.NewSource(time.Now().UnixNano() + int64(worker)))
-			for {
-				if time.Now().After(deadline) {
-					return
-				}
-				select {
-				case <-ctx.Done():
-					return
-				default:
-				}
-				if paceCh != nil {
-					select {
-					case <-paceCh:
-					case <-ctx.Done():
-						return
-					}
-				}
-				fp := rng.Intn(cfg.uniqueIPs)
-				optID := rng.Intn(cfg.optionCount) + 1
-				start := time.Now()
-				status := doVote(c, voteURL, fp, optID)
-				st.record(time.Since(start), status)
-			}
-		}(i)
-	}
-
-	// Прогресс.
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		t := time.NewTicker(time.Second)
-		defer t.Stop()
-		start := time.Now()
-		var last int64
-		for {
-			select {
-			case <-t.C:
-				cur := st.total.Load()
-				fmt.Printf("\r  elapsed=%4.0fs total=%d rps=%.0f acc=%d err=%d",
-					time.Since(start).Seconds(), cur, float64(cur-last), st.accepted.Load(), st.errs.Load())
-				last = cur
-				if time.Now().After(deadline) {
-					fmt.Println()
-					return
-				}
-			case <-ctx.Done():
-				fmt.Println()
-				return
+			switch {
+			case p.resultTotal == acc:
+				// Идеально: сколько клиент получил 202, столько и посчитано.
+			case p.resultTotal > acc:
+				// В результатах БОЛЬШЕ, чем клиент подтвердил. Причина —
+				// сетевые ошибки на клиенте (сервер обработал запрос, но
+				// ответ не дошёл). Это НЕ потеря данных.
+				verdict = fmt.Sprintf("+%d unconfirmed", p.resultTotal-acc)
+			default:
+				// В результатах МЕНЬШЕ — вот это потеря голосов.
+				verdict = fmt.Sprintf("LOST %d", acc-p.resultTotal)
+				mismatches++
 			}
 		}
-	}()
 
-	wg.Wait()
-	<-done
-	return st
+		fmt.Printf("%-4d %-10s %-10s %10d %10d %12s %10s\n",
+			p.index,
+			fmt.Sprintf("+%.0fs", p.beginsAt.Sub(h.t0).Seconds()),
+			fmt.Sprintf("+%.0fs", p.endsAt.Sub(h.t0).Seconds()),
+			acc, p.resultTotal, readyStr, verdict)
+	}
+
+	elapsed := time.Since(h.t0)
+	lat := h.col.latencies
+
+	fmt.Println("\n===== ИТОГИ =====")
+	fmt.Printf("  длительность сценария:   %s\n", elapsed.Round(time.Second))
+	fmt.Printf("  опросов:                 %d\n", len(polls))
+	fmt.Printf("  принято голосов (202):   %d\n", totalAccepted)
+	fmt.Printf("  учтено в результатах:    %d\n", totalResults)
+	fmt.Printf("  отказов 403 (закрыт):    %d\n", h.col.forbidden.Load())
+	fmt.Printf("  bad_request:             %d\n", h.col.badReq.Load())
+	fmt.Printf("  сетевых/прочих ошибок:   %d\n", h.col.errs.Load())
+	fmt.Printf("  RPS (принято/сек):       %.0f\n", float64(totalAccepted)/elapsed.Seconds())
+	fmt.Printf("  latency p50:             %s\n", percentile(lat, 0.50))
+	fmt.Printf("  latency p90:             %s\n", percentile(lat, 0.90))
+	fmt.Printf("  latency p99:             %s\n", percentile(lat, 0.99))
+
+	if len(readiness) > 0 {
+		sort.Slice(readiness, func(i, j int) bool { return readiness[i] < readiness[j] })
+		fmt.Printf("  готовность результатов:  p50=%s p95=%s max=%s (после ends_at)\n",
+			percentileDur(readiness, 0.50),
+			percentileDur(readiness, 0.95),
+			readiness[len(readiness)-1].Round(time.Millisecond))
+	}
+
+	fmt.Println()
+	if mismatches > 0 {
+		return fmt.Errorf("FAILED: %d poll(s) с потерянными голосами или без результатов", mismatches)
+	}
+	fmt.Println("OK: ни один ПОДТВЕРЖДЁННЫЙ голос не потерян, все опросы завершены")
+	fmt.Println("    (колонка '+N unconfirmed' — клиент не дождался ответа, сервер голос учёл)")
+	return nil
 }
 
-// doVote выполняет один запрос голосования с уникальным fingerprint
-// (X-Forwarded-For + User-Agent). Возвращает HTTP-статус (0 = сетевая ошибка).
-func doVote(c *http.Client, url string, fpSeed, optID int) int {
-	body := []byte(fmt.Sprintf(`{"option_id":%d}`, optID))
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
-	if err != nil {
+func percentile(v []time.Duration, p float64) time.Duration {
+	if len(v) == 0 {
 		return 0
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Forwarded-For", fmt.Sprintf("10.%d.%d.%d", (fpSeed>>16)&0xff, (fpSeed>>8)&0xff, fpSeed&0xff))
-	req.Header.Set("User-Agent", fmt.Sprintf("loadtest/1.0 uid=%d", fpSeed))
+	s := append([]time.Duration(nil), v...)
+	sort.Slice(s, func(i, j int) bool { return s[i] < s[j] })
+	return s[int(p*float64(len(s)-1))].Round(time.Microsecond)
+}
 
-	resp, err := c.Do(req)
-	if err != nil {
+func percentileDur(v []time.Duration, p float64) time.Duration {
+	if len(v) == 0 {
 		return 0
 	}
-	_, _ = io.Copy(io.Discard, resp.Body)
-	_ = resp.Body.Close()
-	return resp.StatusCode
-}
-
-func printStats(st *stats, cfg config) {
-	total := st.total.Load()
-	acc := st.accepted.Load()
-	errs := st.errs.Load()
-	closed := st.closed.Load()
-	bad := st.badReq.Load()
-
-	elapsed := cfg.duration.Seconds()
-	if elapsed <= 0 {
-		elapsed = 1
-	}
-
-	st.mu.Lock()
-	lats := st.latencies
-	sort.Slice(lats, func(i, j int) bool { return lats[i] < lats[j] })
-	n := len(lats)
-	pct := func(p float64) time.Duration {
-		if n == 0 {
-			return 0
-		}
-		idx := int(p * float64(n))
-		if idx >= n {
-			idx = n - 1
-		}
-		return lats[idx]
-	}
-	p50, p90, p99, max := pct(0.50), pct(0.90), pct(0.99), time.Duration(0)
-	if n > 0 {
-		max = lats[n-1]
-	}
-	st.mu.Unlock()
-
-	fmt.Printf("  запросов:      %d\n", total)
-	fmt.Printf("  RPS (факт):    %.0f\n", float64(total)/elapsed)
-	fmt.Printf("  accepted:      %d (%.2f%%)\n", acc, percent(acc, total))
-	fmt.Printf("  poll_closed:   %d (%.2f%%)\n", closed, percent(closed, total))
-	fmt.Printf("  bad_request:   %d\n", bad)
-	fmt.Printf("  ошибок:        %d (%.2f%%)\n", errs, percent(errs, total))
-	fmt.Printf("  latency p50:   %s\n", p50)
-	fmt.Printf("  latency p90:   %s\n", p90)
-	fmt.Printf("  latency p99:   %s\n", p99)
-	fmt.Printf("  latency max:   %s\n", max)
-}
-
-func percent(a, total int64) float64 {
-	if total == 0 {
-		return 0
-	}
-	return float64(a) / float64(total) * 100
-}
-
-// waitForResults периодически опрашивает админку, пока не появятся результаты.
-func waitForResults(ctx context.Context, c *http.Client, cfg config, pollID string) error {
-	deadline := time.Now().Add(cfg.graceWait)
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-		}
-		resp, err := c.Get(cfg.adminURL + "/admin/polls/" + pollID + "/results")
-		if err != nil {
-			continue
-		}
-		var poll struct {
-			Status  string `json:"status"`
-			Results *struct {
-				Total   int64 `json:"total"`
-				Options []struct {
-					OptionID int   `json:"option_id"`
-					Count    int64 `json:"count"`
-				} `json:"options"`
-				WorkersSeen int `json:"workers_seen"`
-				WorkersDone int `json:"workers_done"`
-			} `json:"results"`
-		}
-		_ = json.NewDecoder(resp.Body).Decode(&poll)
-		resp.Body.Close()
-
-		if poll.Status == "completed" && poll.Results != nil {
-			fmt.Printf("  status=%s total=%d workers_seen=%d workers_done=%d\n",
-				poll.Status, poll.Results.Total, poll.Results.WorkersSeen, poll.Results.WorkersDone)
-			for _, o := range poll.Results.Options {
-				fmt.Printf("    option %d: %d\n", o.OptionID, o.Count)
-			}
-			return nil
-		}
-		fmt.Printf("  ещё не завершён (status=%s)...\n", poll.Status)
-		if time.Now().After(deadline) {
-			return fmt.Errorf("timeout waiting for results (last status=%s)", poll.Status)
-		}
-	}
+	return v[int(p*float64(len(v)-1))].Round(time.Millisecond)
 }

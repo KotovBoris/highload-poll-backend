@@ -110,6 +110,38 @@ services:
       retries: 30
       start_period: 5s
 
+  # Второй API-воркер: нужен, чтобы проверить, что consumer дожидается "done"
+  # от НЕСКОЛЬКИХ воркеров (каждый шлёт свои голоса и свой done).
+  api2:
+    build:
+      context: .
+    entrypoint: ["/app/bin/api"]
+    environment:
+      HTTP_ADDR: ":8080"
+      KAFKA_BROKERS: "kafka:9092"
+      KAFKA_TOPIC: "votes"
+      RESULTS_URL: "http://results:8081"
+      VOTE_BATCH_SIZE: "10000"
+      POLL_CACHE_TTL: "1m"
+      CLOSE_CHECK_INTERVAL: "500ms"
+      COOKIE_SECRET: "dev-cookie-secret-change-me"
+      MAX_ISSUED_ENTRIES: "1000000"
+      MAX_COOKIES_PER_CLIENT: "1000"
+      DISABLE_ISSUE_LIMIT: "false"
+    ports:
+      - "8083:8080"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      results:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/healthz || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
   consumer:
     build:
       context: .

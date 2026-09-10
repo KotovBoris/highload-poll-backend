@@ -58,5 +58,9 @@ e2e: ## Полный e2e-прогон (поднимает стек, провер
 	./scripts/e2e.sh
 
 .PHONY: loadtest
-loadtest: ## Нагрузочный тест на Go против поднятого стека
-	$(GO) run ./loadtest -base-url http://localhost:8080 -admin-url http://localhost:8081
+loadtest: ## Сценарный нагрузочный тест: 3 мин, 15 опросов по 30 сек
+	$(GO) run ./loadtest
+
+.PHONY: loadtest-smoke
+loadtest-smoke: ## Быстрый smoke нагрузочного теста (~30 сек)
+	$(GO) run ./loadtest -duration 25s -polls 3 -poll-duration 10s -votes-per-poll 3000 -c 200
